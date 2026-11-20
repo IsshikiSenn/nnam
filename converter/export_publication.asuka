@@ -1,0 +1,42 @@
+import std/crypto
+import std/fs
+
+enum ExportPublicationMode {
+  replaceExisting
+  exclusive
+}
+
+fn publishExport(destination: string, mode: ExportPublicationMode, writer: AudioExportWriter) throws -> (string, [string]) {
+  try writer.source.checkUnchanged()
+  let temporary = fs.join([fs.dir(destination), ".nnam-{crypto.uuid()}.part"])
+  let handle = nnam_output_open(temporary) else { throw Error("无法创建临时文件") }
+  let output = StreamOutput(handle: handle)
+  defer { try? fs.remove(temporary) }
+  defer { try? output.close() }
+
+  let warnings = try writer.write(output)
+  try output.close()
+  try writer.source.checkUnchanged()
+
+  let savedPath = match mode {
+    .replaceExisting => {
+      try fs.rename(temporary, to: destination)
+      destination
+    }
+    .exclusive => try publishNewOutput(temporary, destination: destination)
+  }
+  return (savedPath, warnings)
+}
+
+fn publishNewOutput(temporary: string, destination: string) throws -> string {
+  let extension = fs.ext(destination)
+  let stem = destination.trimSuffix(extension)
+  var sequence = 1
+  while true {
+    let candidate = if sequence == 1 { destination } else { "{stem} ({sequence}){extension}" }
+    let status = nnam_output_publish_new(temporary, candidate)
+    if status == 0 { return candidate }
+    if status != 1 { throw Error("无法保存批量导出文件") }
+    sequence += 1
+  }
+}

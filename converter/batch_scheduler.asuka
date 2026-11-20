@@ -1,0 +1,88 @@
+let batchInitialConcurrency = 2
+let batchMaxConcurrency = 4
+let batchSampleWaves = 2
+let batchSampleDuration = 400ms
+let batchMinimumGain = 1.10
+
+struct BatchJob {
+  index: int
+  input: string
+  limit: int
+}
+
+struct BatchScheduler {
+  paths: [string]
+  results: [NcmBatchResult?]
+  startedAt: Duration?
+  next: int = 0
+  active: int = 0
+  limit: int = batchInitialConcurrency
+  carryover: int = 0
+  sampleFiles: int = 0
+  sampleBytes: int = 0
+  previousRate: float? = none
+  settled: bool = false
+
+  mut fn take() -> BatchJob? {
+    if next == paths.count() || active >= limit { return none }
+    let job = BatchJob(index: next, input: paths[next], limit: limit)
+    next += 1
+    active += 1
+    return job
+  }
+
+  // Returns true when the executor should start one more dispatch lane.
+  mut fn complete(job: BatchJob, outcome: NcmBatchOutcome, at: Duration) -> bool {
+    active -= 1
+    results[job.index] = NcmBatchResult(input: job.input, outcome: outcome)
+    if settled { return false }
+    if job.limit != limit {
+      carryover -= 1
+      return false
+    }
+    if carryover > 0 { return false }
+    let .exported(export) = outcome else { return false }
+    if export.inputByteCount <= 0 { return false }
+
+    // The first successful completion after the old limit drains starts the trial.
+    let start = startedAt else {
+      startedAt = at
+      return false
+    }
+    sampleFiles += 1
+    sampleBytes += export.inputByteCount
+    let elapsed = at - start
+    if sampleFiles < limit * batchSampleWaves || sampleFiles % limit != 0 || elapsed < batchSampleDuration {
+      return false
+    }
+
+    let rate = float(sampleBytes) / elapsed.seconds()
+    if let previous = previousRate {
+      if rate < previous * batchMinimumGain {
+        limit -= 1
+        settled = true
+        return false
+      }
+    }
+    // Leave enough jobs to fill the higher limit and measure it under load.
+    if limit == batchMaxConcurrency || paths.count() - next < (limit + 1) * (batchSampleWaves + 1) - 1 {
+      settled = true
+      return false
+    }
+    previousRate = rate
+    limit += 1
+    carryover = active
+    startedAt = none
+    sampleFiles = 0
+    sampleBytes = 0
+    return true
+  }
+
+  fn orderedResults() -> [NcmBatchResult] {
+    return results.compactMap(result => result)
+  }
+}
+
+fn startBatchScheduler(paths: [string], at: Duration) -> BatchScheduler {
+  return BatchScheduler(paths: paths, results: paths.map(path => none), startedAt: at)
+}

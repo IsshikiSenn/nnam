@@ -1,0 +1,92 @@
+import std/encoding
+
+let chunkSize = 64 * 1024
+
+extern type StreamInput with release nnam_input_release
+extern fn nnam_input_release(input: StreamInput)
+extern fn nnam_input_open(path: CString) -> StreamInput?
+extern fn nnam_input_size(input: StreamInput) -> Int64
+extern fn nnam_input_unchanged(input: StreamInput) -> bool
+extern fn nnam_input_byte(input: StreamInput, offset: Int64) -> Int32
+extern fn nnam_input_read(input: StreamInput, offset: Int64, length: Int64) -> CString?
+extern fn nnam_input_clear_large_read(input: StreamInput)
+
+extern type StreamOutputHandle with release nnam_output_release
+extern fn nnam_output_release(output: StreamOutputHandle)
+extern fn nnam_output_open(path: CString) -> StreamOutputHandle?
+extern fn nnam_output_write(output: StreamOutputHandle, data: bytes) -> bool
+extern fn nnam_output_close(output: StreamOutputHandle) -> bool
+extern fn nnam_output_publish_new(temporary: CString, destination: CString) -> Int32
+
+struct StreamOutput {
+  handle: StreamOutputHandle
+
+  fn write(data: bytes) throws {
+    if !nnam_output_write(handle, data) { throw Error("写入临时文件失败") }
+  }
+
+  fn close() throws {
+    if !nnam_output_close(handle) { throw Error("关闭临时文件失败") }
+  }
+}
+
+enum BinaryInput {
+  memory(data: bytes)
+  file(handle: StreamInput, length: int)
+
+  fn count() -> int = match self {
+    .memory(data) => data.count()
+    .file(_, length) => length
+  }
+
+  fn read(from: int, length: int) throws -> bytes {
+    if from < 0 || length < 0 || from > count() || length > count() - from {
+      throw Error("文件不完整或数据段长度无效")
+    }
+    if length == 0 { return bytes() }
+    match self {
+      .memory(data) => { return data.slice(from, from + length) }
+      .file(handle, _) => {
+        defer {
+          if length > chunkSize { nnam_input_clear_large_read(handle) }
+        }
+        let encoded = nnam_input_read(handle, from, length) else {
+          throw Error("读取 NCM 文件失败，文件可能已被修改或截断")
+        }
+        return try encoding.base64Decode(encoded)
+      }
+    }
+  }
+
+  fn byteAt(position: int) throws -> int {
+    match self {
+      .memory(data) => { return data[position] }
+      .file(handle, _) => {
+        let value = nnam_input_byte(handle, position)
+        if value < 0 { throw Error("读取 NCM 文件失败，文件可能已被修改或截断") }
+        return value
+      }
+    }
+  }
+
+  fn checkUnchanged() throws {
+    if let .file(handle, _) = self {
+      if !nnam_input_unchanged(handle) { throw Error("NCM 文件已被修改，请重新选择") }
+    }
+  }
+
+  fn copy(from: int, length: int, to: StreamOutput) throws {
+    let end = from + length
+    var position = from
+    while position < end {
+      let size = min(chunkSize, end - position)
+      try to.write(read(position, length: size))
+      position += size
+    }
+  }
+}
+
+fn openNcmInput(path: string) throws -> BinaryInput {
+  let handle = nnam_input_open(path) else { throw Error("无法打开 NCM 文件") }
+  return .file(handle: handle, length: nnam_input_size(handle))
+}

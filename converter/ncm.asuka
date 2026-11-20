@@ -1,0 +1,191 @@
+import std/encoding
+import std/fs
+
+let coreKey = "hzHRAmso5kInbaxW".bytes()
+let metadataKey = "#14ljk_!\\]&0U<'(".bytes()
+let audioKeyPrefix = "neteasecloudmusic".bytes()
+let metadataWrapper = "163 key(Don't modify):".bytes()
+let musicPrefix = "music:".bytes()
+let maxNcmKeySize = 64 * 1024
+let maxNcmMetadataSize = 4 * 1024 * 1024
+
+struct BinaryReader {
+  input: BinaryInput
+  offset: int = 0
+
+  mut fn skip(length: int) throws {
+    if length < 0 || length > input.count() - offset {
+      throw Error("文件不完整或数据段长度无效")
+    }
+    offset += length
+  }
+
+  mut fn read(length: int) throws -> bytes {
+    let start = offset
+    try skip(length)
+    return try input.read(start, length: length)
+  }
+
+  mut fn readLength() throws -> int {
+    return readLittle32(try read(4), at: 0)
+  }
+}
+
+struct NcmAudio {
+  source: AudioSource
+  format: AudioFormat
+  metadata: NcmMetadata?
+  metadataIssue: NcmMetadataIssue?
+  cover: NcmCover?
+}
+
+enum NcmMetadataIssue {
+  missing
+  undecodable
+
+  fn message() -> string = match self {
+    .missing => "源文件未提供歌曲信息"
+    .undecodable => "NCM 歌曲信息解码失败"
+  }
+}
+
+pub struct NcmSummary {
+  name: string
+  format: string
+  byteCount: int
+  metadata: NcmMetadata?
+  metadataWarning: string?
+  hasCover: bool
+}
+
+pub struct NcmExportResult {
+  destination: string
+  warnings: [string]
+  inputByteCount: int = 0
+}
+
+fn decodeAudioKey(data: bytes) throws -> bytes {
+  let unmasked = maskBytes(data, mask: 0x64)
+  let plain = try removePkcs7(aes128EcbDecrypt(coreKey, ciphertext: unmasked))
+  if plain.count() <= audioKeyPrefix.count() ||
+    plain.slice(0, audioKeyPrefix.count()) != audioKeyPrefix {
+    throw Error("NCM 音频密钥无效")
+  }
+  return plain.slice(audioKeyPrefix.count(), plain.count())
+}
+
+fn decodeMetadata(data: bytes) throws -> NcmMetadata {
+  let unmasked = maskBytes(data, mask: 0x63)
+  if unmasked.count() <= metadataWrapper.count() ||
+    unmasked.slice(0, metadataWrapper.count()) != metadataWrapper {
+    throw Error("NCM 元数据前缀无效")
+  }
+
+  let encoded = unmasked.slice(metadataWrapper.count(), unmasked.count()).string()
+  let ciphertext = try encoding.base64Decode(encoded)
+  let plain = try removePkcs7(aes128EcbDecrypt(metadataKey, ciphertext: ciphertext))
+  if plain.count() <= musicPrefix.count() || plain.slice(0, musicPrefix.count()) != musicPrefix {
+    throw Error("NCM 音乐元数据无效")
+  }
+  return try parseMusicMetadata(plain.slice(musicPrefix.count(), plain.count()).string())
+}
+
+fn maskBytes(data: bytes, mask: int) -> bytes {
+  var output: [int] = []
+  for i in 0..<data.count() {
+    output.push(data[i] ^ mask)
+  }
+  return bytes(output)
+}
+
+fn parseNcm(input: BinaryInput) throws -> NcmAudio {
+  var reader = BinaryReader(input: input)
+  let magic = try reader.read(8)
+  if magic != "CTENFDAM".bytes() {
+    throw Error("请选择有效的 NCM 文件")
+  }
+  try reader.skip(2)
+
+  let keyLength = try reader.readLength()
+  if keyLength > maxNcmKeySize { throw Error("NCM 音频密钥段过大") }
+  let key = try decodeAudioKey(reader.read(keyLength))
+
+  let metadataLength = try reader.readLength()
+  let metadata: NcmMetadata? = if metadataLength > maxNcmMetadataSize {
+    try reader.skip(metadataLength)
+    none
+  } else if metadataLength == 0 {
+    none
+  } else {
+    let blob = try reader.read(metadataLength)
+    try? decodeMetadata(blob)
+  }
+  let metadataIssue: NcmMetadataIssue? = if metadataLength == 0 {
+    .missing
+  } else if metadata == none {
+    .undecodable
+  } else {
+    none
+  }
+
+  try reader.skip(5)
+  let coverFrameLength = try reader.readLength()
+  let coverImageLength = try reader.readLength()
+  let coverOffset = reader.offset
+  // Some older files store only the image length. Newer files can pad the frame.
+  try reader.skip(max(coverFrameLength, coverImageLength))
+  let signature = try input.read(coverOffset, length: min(8, coverImageLength))
+  let cover = embeddedCover(signature, offset: coverOffset, length: coverImageLength)
+
+  let source = makeAudioSource(input, fileOffset: reader.offset, key: key)
+  let format = try inspectAudioFormat(source)
+  try source.checkUnchanged()
+  return NcmAudio(source: source, format: format,
+    metadata: metadata, metadataIssue: metadataIssue, cover: cover)
+}
+
+fn writeAudio(audio: NcmAudio, destination: string, mode: ExportPublicationMode) throws -> NcmExportResult {
+  let extension = audio.format.fileExtension()
+  if fs.ext(destination).lower() != ".{extension}" {
+    throw Error("输出文件扩展名需要为 .{extension}")
+  }
+  let tags = (audio.metadata ?? NcmMetadata()).tags()
+  let writer = AudioExportWriter(source: audio.source, format: audio.format, tags: tags, cover: audio.cover)
+  let (savedPath, formatWarnings) = try publishExport(destination, mode: mode, writer: writer)
+
+  var warnings: [string] = []
+  if audio.metadataIssue == .undecodable {
+    warnings.push(NcmMetadataIssue.undecodable.message())
+  }
+  return NcmExportResult(destination: savedPath, warnings: warnings + formatWarnings, inputByteCount: audio.source.fileByteCount())
+}
+
+pub worker NcmConverter {
+  var audio: NcmAudio? = none
+
+  pub fn open(path: string) throws -> NcmSummary {
+    audio = none
+    let parsed = try parseNcm(openNcmInput(path))
+    audio = parsed
+    return NcmSummary(name: fs.base(path), format: parsed.format.fileExtension(),
+      byteCount: parsed.source.count(), metadata: parsed.metadata,
+      metadataWarning: parsed.metadataIssue?.message(), hasCover: parsed.cover != none)
+  }
+
+  pub fn exportAudio(destination: string) throws -> NcmExportResult {
+    let parsed = audio else { throw Error("请先选择 NCM 文件") }
+    return try writeAudio(parsed, destination: destination, mode: .replaceExisting)
+  }
+
+  pub fn convertInFolder(path: string, folder: string) throws -> NcmExportResult {
+    let parsed = try parseNcm(openNcmInput(path))
+    let name = fs.base(path)
+    let stem = name.trimSuffix(fs.ext(name))
+    let destination = fs.join([folder, "{stem}.{parsed.format.fileExtension()}"])
+    var result = try writeAudio(parsed, destination: destination, mode: .exclusive)
+    if parsed.metadataIssue == .missing {
+      result.warnings.push(NcmMetadataIssue.missing.message())
+    }
+    return result
+  }
+}

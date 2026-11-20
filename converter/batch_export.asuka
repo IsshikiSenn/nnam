@@ -1,0 +1,72 @@
+import std/time
+
+pub enum NcmBatchOutcome {
+  exported(NcmExportResult)
+  failed(string)
+
+  fn succeeded() -> bool = match self {
+    .exported(_) => true
+    .failed(_) => false
+  }
+}
+
+pub struct NcmBatchResult {
+  input: string
+  outcome: NcmBatchOutcome
+}
+
+pub enum NcmBatchEvent {
+  started(index: int, input: string)
+  finished(index: int, outcome: NcmBatchOutcome)
+}
+
+pub async fn exportNcmBatch(paths: [string], folder: string,
+  onProgress: fn(NcmBatchEvent) = event => {},
+) -> [NcmBatchResult] {
+  return await runNcmBatch(paths, convert: path => await exportNcmBatchItem(path, folder: folder),
+    onProgress: onProgress)
+}
+
+async fn runNcmBatch(paths: [string], convert: async fn(string) -> NcmBatchOutcome,
+  onProgress: fn(NcmBatchEvent),
+) -> [NcmBatchResult] {
+  var scheduler = startBatchScheduler(paths, at: time.monotonic())
+
+  // Both closures run on the main thread. Only conversion awaits the worker.
+  let take: fn() -> BatchJob? = () => {
+    let job = scheduler.take() else { return none }
+    onProgress(.started(index: job.index, input: job.input))
+    return job
+  }
+  let complete: fn(BatchJob, NcmBatchOutcome) -> bool = (job, outcome) => {
+    onProgress(.finished(index: job.index, outcome: outcome))
+    return scheduler.complete(job, outcome: outcome, at: time.monotonic())
+  }
+
+  await all(0..<batchInitialConcurrency, _ => await drainBatch(take, convert: convert, complete: complete))
+  return scheduler.orderedResults()
+}
+
+async fn drainBatch(take: fn() -> BatchJob?, convert: async fn(string) -> NcmBatchOutcome,
+  complete: fn(BatchJob, NcmBatchOutcome) -> bool,
+) {
+  while let job = take() {
+    let outcome = await convert(job.input)
+    if complete(job, outcome) {
+      // Keep both lanes under the original batch task so cancellation propagates.
+      await all(drainBatch(take, convert: convert, complete: complete),
+        drainBatch(take, convert: convert, complete: complete))
+      return
+    }
+  }
+}
+
+async fn exportNcmBatchItem(path: string, folder: string) -> NcmBatchOutcome {
+  let converter = NcmConverter()
+  do {
+    let result = try await converter.convertInFolder(path, folder: folder)
+    return .exported(result)
+  } catch error {
+    return .failed(error.message)
+  }
+}

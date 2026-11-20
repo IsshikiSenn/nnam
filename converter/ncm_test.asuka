@@ -1,0 +1,42 @@
+import std/encoding
+
+test "AES-128-ECB decrypts both NIST known-answer blocks" {
+  let key = try encoding.hexDecode("2b7e151628aed2a6abf7158809cf4f3c")
+  let ciphertext = try encoding.hexDecode(
+    "3ad77bb40d7a3660a89ecaf32466ef97f5d3d58503b9699de785895a96fdbaaf",
+  )
+  let expected = try encoding.hexDecode(
+    "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51",
+  )
+  expect(try aes128EcbDecrypt(key, ciphertext: ciphertext) == expected)
+}
+
+test "PKCS#7 rejects inconsistent padding" {
+  expect(try removePkcs7(bytes([0x61, 0x62, 0x02, 0x02])) == "ab".bytes())
+  expect((try? removePkcs7(bytes([0x61, 0x62, 0x01, 0x02]))) == none)
+}
+
+test "NCM rejects a truncated key section" {
+  let truncated = "CTENFDAM".bytes().concat(bytes([0, 0, 16, 0, 0, 0, 1, 2]))
+  expect((try? parseNcm(.memory(truncated))) == none)
+}
+
+test "NCM decryption preserves key alignment across arbitrary chunk boundaries" (data: bytes, key: bytes, firstOffset: int, split: int) {
+  let source = makeAudioSource(.memory(data), fileOffset: 0, key: bytes([1]).concat(key))
+  let offset = (firstOffset & 0xffff) % (data.count() + 1)
+  let length = data.count() - offset
+  let cut = (split & 0xffff) % (length + 1)
+  let whole = try source.read(offset, length: length)
+  let first = try source.read(offset, length: cut)
+  let last = try source.read(offset + cut, length: length - cut)
+  expect(first.concat(last) == whole)
+}
+
+bench "NCM decrypts a 64 KiB chunk" {
+  let data = "0123456789abcdef".repeat(chunkSize / 16).bytes()
+  let stream = buildKeyStream("nnam benchmark key".bytes())
+  measure {
+    var decoder = AudioDecoder(keyStream: stream)
+    keep(decoder.decode(data, audioOffset: 0))
+  }
+}

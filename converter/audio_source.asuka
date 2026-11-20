@@ -1,0 +1,105 @@
+let audioRangeError = "音频数据长度超出文件范围"
+let audioKeyStreamSize = 256
+let audioKeyIndexMask = audioKeyStreamSize - 1
+
+struct AudioSource {
+  input: BinaryInput
+  fileOffset: int
+  length: int
+  keyStream: [int]
+
+  fn count() -> int = length
+
+  fn fileByteCount() -> int = input.count()
+
+  fn checkUnchanged() throws {
+    try input.checkUnchanged()
+  }
+
+  fn checkRange(from: int, length: int) throws {
+    let available = count()
+    if from < 0 || length < 0 || from > available || length > available - from {
+      throw Error(audioRangeError)
+    }
+  }
+
+  fn byteAt(position: int) throws -> int {
+    if position < 0 || position >= length { throw Error(audioRangeError) }
+    return (try input.byteAt(fileOffset + position)) ^ keyStream[position & audioKeyIndexMask]
+  }
+
+  fn read(from: int, length: int) throws -> bytes {
+    try checkRange(from, length: length)
+    let raw = try input.read(fileOffset + from, length: length)
+    var decoder = AudioDecoder(keyStream: keyStream)
+    return decoder.decode(raw, audioOffset: from)
+  }
+
+  fn copy(from: int, length: int, to: StreamOutput) throws {
+    try checkRange(from, length: length)
+    let end = from + length
+    var position = from
+    var decoder = AudioDecoder(keyStream: keyStream)
+    while position < end {
+      let size = min(chunkSize, end - position)
+      let raw = try input.read(fileOffset + position, length: size)
+      try to.write(decoder.decode(raw, audioOffset: position))
+      position += size
+    }
+  }
+
+  fn copyCover(cover: NcmCover, to: StreamOutput) throws {
+    try input.copy(from: cover.offset, length: cover.length, to: to)
+  }
+}
+
+fn makeAudioSource(input: BinaryInput, fileOffset: int, key: bytes) -> AudioSource {
+  let length = input.count() - fileOffset
+  return AudioSource(input: input, fileOffset: fileOffset, length: length, keyStream: buildKeyStream(key))
+}
+
+fn buildKeyStream(key: bytes) -> [int] {
+  var box: [int] = []
+  for i in 0..<audioKeyStreamSize {
+    box.push(i)
+  }
+  var j = 0
+  for i in 0..<audioKeyStreamSize {
+    j = (j + box[i] + key[i % key.count()]) & audioKeyIndexMask
+    let previous = box[i]
+    box[i] = box[j]
+    box[j] = previous
+  }
+
+  var keyStream: [int] = []
+  for i in 0..<audioKeyStreamSize {
+    let index = (i + 1) & audioKeyIndexMask
+    let value = box[index]
+    keyStream.push(box[(value + box[(value + index) & audioKeyIndexMask]) & audioKeyIndexMask])
+  }
+  return keyStream
+}
+
+struct AudioDecoder {
+  keyStream: [int]
+  output: [int] = []
+
+  mut fn decode(data: bytes, audioOffset: int) -> bytes {
+    // Release the field's reference so the local array can be updated in place.
+    var decoded = output
+    output = []
+    let stream = keyStream
+    let keyMask = audioKeyIndexMask
+    let count = data.count()
+    let reusable = min(count, decoded.count())
+    for i in 0..<reusable {
+      decoded[i] = data[i] ^ stream[(audioOffset + i) & keyMask]
+    }
+    for i in reusable..<count {
+      decoded.push(data[i] ^ stream[(audioOffset + i) & keyMask])
+    }
+    let result = bytes(if count < decoded.count() { decoded.slice(0, count) } else { decoded })
+    output = decoded
+    return result
+  }
+}

@@ -1,0 +1,150 @@
+import std/crypto
+import std/encoding
+import std/fs
+
+test "Batch export reports starts and outcomes in processing order" {
+  let paths = ["slow.ncm", "broken.ncm", "next.ncm"]
+  var progress: [string] = []
+  let results = await runNcmBatch(paths, convert: path => {
+    if path == "slow.ncm" { await sleep(1s) }
+    return if path == "broken.ncm" {
+      .failed("无效文件")
+    } else {
+      .exported(NcmExportResult(destination: "{path}.mp3", warnings: []))
+    }
+  }, onProgress: event => {
+    match event {
+      .started(index, input) => { progress.push("start {index} {input}") }
+      .finished(index, outcome) => { progress.push("finish {index} {outcome.succeeded()}") }
+    }
+  })
+
+  expect(progress == [
+    "start 0 slow.ncm", "start 1 broken.ncm", "finish 1 false",
+    "start 2 next.ncm", "finish 2 true", "finish 0 true",
+  ])
+  expect(results.map(result => result.input) == paths)
+  expect(results.map(result => result.outcome.succeeded()) == [true, false, true])
+}
+
+fn batchTestPaths(count: int) -> [string] {
+  var paths: [string] = []
+  for index in 0..<count { paths.push("track-{index}.ncm") }
+  return paths
+}
+
+let batchTestSuccess = NcmBatchOutcome.exported(NcmExportResult(destination: "track.mp3", warnings: [], inputByteCount: 1024))
+
+test "Batch export waits for the old limit to drain before sampling faster work" {
+  var scheduler = startBatchScheduler(batchTestPaths(40), at: 0ms)
+  let oldJob = scheduler.take() else { throw Error("Missing long-running job") }
+  let first = scheduler.take() else { throw Error("Missing initial job") }
+  expect(scheduler.take() == none)
+  expect(!scheduler.complete(first, outcome: batchTestSuccess, at: 60ms))
+  // Four successes are too soon, and five are not a whole number of waves.
+  for at in [120ms, 180ms, 240ms, 400ms] {
+    let job = scheduler.take() else { throw Error("Missing baseline job") }
+    expect(!scheduler.complete(job, outcome: batchTestSuccess, at: at))
+  }
+  let baseline = scheduler.take() else { throw Error("Missing final baseline job") }
+  expect(scheduler.complete(baseline, outcome: batchTestSuccess, at: 500ms))
+
+  let anchor = scheduler.take() else { throw Error("Missing job at the higher limit") }
+  for at in [550ms, 650ms, 750ms, 850ms, 950ms, 1050ms, 1150ms] {
+    let job = scheduler.take() else { throw Error("Missing third concurrent job") }
+    expect(scheduler.take() == none)
+    expect(!scheduler.complete(job, outcome: batchTestSuccess, at: at))
+  }
+  expect(!scheduler.complete(oldJob, outcome: .failed("old limit failure"), at: 1175ms))
+  let failedTrial = scheduler.take() else { throw Error("Missing trial job") }
+  expect(!scheduler.complete(failedTrial, outcome: .failed("trial failure"), at: 1200ms))
+  expect(!scheduler.complete(anchor, outcome: batchTestSuccess, at: 1300ms))
+
+  for at in [1350ms, 1400ms, 1450ms, 1500ms, 1600ms] {
+    let job = scheduler.take() else { throw Error("Missing sample job") }
+    expect(!scheduler.complete(job, outcome: batchTestSuccess, at: at))
+  }
+  let failedSample = scheduler.take() else { throw Error("Missing job during sampling") }
+  expect(!scheduler.complete(failedSample, outcome: .failed("sample failure"), at: 1650ms))
+  let fasterTrial = scheduler.take() else { throw Error("Missing final sample job") }
+  expect(scheduler.complete(fasterTrial, outcome: batchTestSuccess, at: 1700ms))
+  for _ in 0..<4 { expect(scheduler.take() != none) }
+  expect(scheduler.take() == none)
+}
+
+test "Batch export drains to two workers after a slower trial" {
+  let paths = batchTestPaths(24)
+  var scheduler = startBatchScheduler(paths, at: 0ms)
+  for at in [100ms, 200ms, 300ms] {
+    let job = scheduler.take() else { throw Error("Missing baseline job") }
+    expect(!scheduler.complete(job, outcome: batchTestSuccess, at: at))
+  }
+  let baseline = scheduler.take() else { throw Error("Missing final baseline job") }
+  expect(scheduler.complete(baseline, outcome: batchTestSuccess, at: 400ms))
+  let anchor = scheduler.take() else { throw Error("Missing trial anchor job") }
+  expect(!scheduler.complete(anchor, outcome: batchTestSuccess, at: 500ms))
+
+  let firstInFlight = scheduler.take() else { throw Error("Missing first in-flight job") }
+  let secondInFlight = scheduler.take() else { throw Error("Missing second in-flight job") }
+  for at in [650ms, 800ms, 950ms, 1100ms, 1250ms, 1400ms] {
+    let job = scheduler.take() else { throw Error("Missing slower trial job") }
+    expect(!scheduler.complete(job, outcome: batchTestSuccess, at: at))
+  }
+
+  expect(scheduler.take() == none)
+  expect(!scheduler.complete(secondInFlight, outcome: batchTestSuccess, at: 1450ms))
+  let replacement = scheduler.take() else { throw Error("Expected a job after a lane freed up") }
+  expect(scheduler.take() == none)
+  expect(!scheduler.complete(firstInFlight, outcome: batchTestSuccess, at: 1500ms))
+  expect(!scheduler.complete(replacement, outcome: batchTestSuccess, at: 1550ms))
+  var at = 1650ms
+  while let job = scheduler.take() {
+    expect(!scheduler.complete(job, outcome: batchTestSuccess, at: at))
+    at += 100ms
+  }
+  expect(scheduler.orderedResults().map(result => result.input) == paths)
+}
+
+test "Batch export keeps order, isolates failures, and publishes same names without overwriting" {
+  let root = fs.join([fs.tempDir(), "nnam-batch-{crypto.uuid()}"])
+  let firstFolder = fs.join([root, "first"])
+  let secondFolder = fs.join([root, "second"])
+  let outputFolder = fs.join([root, "export"])
+  defer { try? fs.removeAll(root) }
+  for folder in [firstFolder, secondFolder, outputFolder] { try fs.mkdirAll(folder) }
+
+  let existing = fs.join([outputFolder, "song.mp3"])
+  let occupiedFolder = fs.join([outputFolder, "song (2).mp3"])
+  let first = fs.join([firstFolder, "song.ncm"])
+  let second = fs.join([secondFolder, "song.ncm"])
+  let invalid = fs.join([root, "broken.ncm"])
+  let flac = fs.join([root, "other.ncm"])
+  let firstFrames = mpeg25Frame(1)
+  let secondFrames = mpeg25Frame(2)
+  let flacFrames = try encoding.hexDecode(threeFlacFrames)
+
+  try fs.write(existing, data: "keep me".bytes())
+  try fs.mkdirAll(occupiedFolder)
+  try fs.write(first, data: validationNcm(firstFrames))
+  try fs.write(second, data: validationNcm(secondFrames))
+  try fs.write(invalid, data: "not an NCM".bytes())
+  try fs.write(flac, data: validationNcm(flacFrames))
+
+  let paths = [first, second, invalid, flac]
+  let results = await exportNcmBatch(paths, folder: outputFolder)
+  expect(results.map(result => result.input) == paths)
+  let .exported(firstExport) = results[0].outcome else { throw Error("First item failed") }
+  let .exported(secondExport) = results[1].outcome else { throw Error("Second item failed") }
+  let .failed(reason) = results[2].outcome else { throw Error("Broken item was accepted") }
+  let .exported(flacExport) = results[3].outcome else { throw Error("Last item did not run") }
+  expect(reason == "请选择有效的 NCM 文件")
+  expect([fs.base(firstExport.destination), fs.base(secondExport.destination)].sorted() == ["song (3).mp3", "song (4).mp3"])
+  expect(try fs.read(firstExport.destination) == firstFrames)
+  expect(try fs.read(secondExport.destination) == secondFrames)
+  expect(try fs.read(flacExport.destination) == flacFrames)
+  expect(try fs.read(existing) == "keep me".bytes())
+  expect(try fs.stat(occupiedFolder).isDir)
+  expect(firstExport.warnings == ["源文件未提供歌曲信息"])
+  expect(firstExport.inputByteCount == (try fs.stat(first)).size)
+  expect((try fs.readDir(outputFolder)).count() == 5)
+}

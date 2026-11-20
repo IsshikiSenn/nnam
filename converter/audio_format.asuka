@@ -1,0 +1,64 @@
+let maxTagRecords = 65_536
+
+enum AudioFormat {
+  flac
+  mp3(layout: Mp3Layout)
+
+  fn fileExtension() -> string = match self {
+    .flac => "flac"
+    .mp3(_) => "mp3"
+  }
+
+  fn write(source: AudioSource, tags: [string: string], cover: NcmCover?, destination: StreamOutput) throws -> [string] {
+    match self {
+      .flac => {
+        try writeFlacAudio(source, tags: tags, cover: cover, destination: destination)
+        return []
+      }
+      .mp3(layout) => {
+        return try writeMp3Audio(source, layout: layout, tags: tags, cover: cover, destination: destination)
+      }
+    }
+  }
+}
+
+struct AudioExportWriter {
+  source: AudioSource
+  format: AudioFormat
+  tags: [string: string]
+  cover: NcmCover?
+
+  fn write(output: StreamOutput) throws -> [string] {
+    return try format.write(source, tags: tags, cover: cover, destination: output)
+  }
+}
+
+fn inspectAudioFormat(source: AudioSource) throws -> AudioFormat {
+  let header = try source.read(0, length: min(4, source.count()))
+  if header == "fLaC".bytes() {
+    try validateFlac(source)
+    return .flac
+  }
+  let hasId3 = header.count() >= 3 && header.slice(0, 3) == "ID3".bytes()
+  if hasId3 ||
+    (header.count() >= 2 && header[0] == 0xff && (header[1] & 0xe0) == 0xe0) {
+    return .mp3(layout: try inspectMp3(source, hasTag: hasId3))
+  }
+  throw Error("无法识别解密后的音频格式，目前支持 FLAC 和 MP3")
+}
+
+fn little32(value: int) -> bytes {
+  return bytes([value & 0xff, (value >> 8) & 0xff, (value >> 16) & 0xff, (value >> 24) & 0xff])
+}
+
+fn readLittle32(data: bytes, at: int) -> int {
+  return data[at] | (data[at + 1] << 8) | (data[at + 2] << 16) | (data[at + 3] << 24)
+}
+
+fn big32(value: int) -> bytes {
+  return bytes([(value >> 24) & 0xff, (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff])
+}
+
+fn readBig32(data: bytes, at: int) -> int {
+  return (data[at] << 24) | (data[at + 1] << 16) | (data[at + 2] << 8) | data[at + 3]
+}

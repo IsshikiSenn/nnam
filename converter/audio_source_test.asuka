@@ -1,0 +1,66 @@
+import std/crypto
+import std/encoding
+import std/fs
+
+// Two known ciphertext periods computed independently for the key below.
+let audioCipherPeriod =
+  "b6f04e0e01b921b7b1225973a49434ff3abd1d07bdbaa0b1cda81f9fab95719a" +
+  "7b06b73ea844e39673e0c9bef14e962fca65e888e78d0f4ebecbb55b7dd8acbd" +
+  "586d38bfa906b84c98a5737664c21782b3c801b5e659da8964a77c50558ceb88" +
+  "b76f3aa437aa2fbc3cef31e2f1aaf4ec4bdcf2768a9d2e8fd4b20093f3ad6ad6" +
+  "961fd0f9a53e7e48ea509cc1a1281658af5d36b5e5a85f4d1cd3edb33c4c5944" +
+  "5269a2e071dbf63686ad9f541a9ef50644964fa8631e09770fb2ef7101357314" +
+  "014d1414881291a64dceea733984a3ad4a6919a88755c4635abc1c4e99da39b5" +
+  "1100cbe33896de84cb8cb05138256d025cb5e6d0dbb9d430756d1c079c9c867c"
+
+let audioCipherTail =
+  "c084387e77cd2eb8be2d0d25f4c260a94cc96b77cbceafbec2a74bc9fbc325cc" +
+  "0d72c14ede30ec997cef9de8a118c279bc119ef891f90041b1c4e10d2d8ef8eb" +
+  "2e194ecfdf72b74397aa2720349443d4c5bc77c5902dd5866ba8280605dabfde" +
+  "c11b4cd441de20b333e065b4a1fca0ba3da88406fce92180dbbd54c5a3fb3e80" +
+  "e06ba689d34a7147e55fc897f17e420ed92940c593dc504213dcb9e56c1a0d12" +
+  "241dd49007aff93989a2cb024ac8a15032e239d8156a067800bdbb2751632742" +
+  "77396264fe669ea942c1be2569d2f7fb3c1d6fd8f121cb6c55b34818c98c6de3" +
+  "6774bd934ee2d18bc483e407687339542ac190a0adcddb3f7a624851cccad22a"
+
+test "Audio source reads and copies known plaintext across key and chunk boundaries" {
+  let prefix = "NCM header with padding".bytes()
+  let encrypted = try encoding.hexDecode(audioCipherPeriod.repeat(2 * chunkSize / 256) + audioCipherTail)
+  let expected = "0123456789abcdef".repeat(2 * chunkSize / 16).bytes().concat("FEDCBA9876543210".repeat(16).bytes())
+  let source = makeAudioSource(.memory(prefix.concat(encrypted)), fileOffset: prefix.count(), key: "audio source vector".bytes())
+  let size = expected.count()
+  expect(source.count() == size)
+  expect(source.fileByteCount() == prefix.count() + size)
+  for position in [0, 253, 255, 256, chunkSize - 1, chunkSize, size - 1] {
+    expect(try source.byteAt(position) == expected[position])
+  }
+  for position in [250, chunkSize - 4, 2 * chunkSize - 4] {
+    expect(try source.read(position, length: 12) == expected.slice(position, position + 12))
+  }
+  expect((try? source.byteAt(-1)) == none)
+  expect((try? source.byteAt(size)) == none)
+  expect(try source.read(size, length: 0) == bytes())
+  expect((try? source.read(size + 1, length: 0)) == none)
+  expect((try? source.read(size - 1, length: 2)) == none)
+
+  let path = fs.join([fs.tempDir(), "nnam-source-{crypto.uuid()}"])
+  let handle = nnam_output_open(path) else { throw Error("Unable to create test output") }
+  let output = StreamOutput(handle: handle)
+  defer { try? fs.remove(path) }
+  defer { try? output.close() }
+  let start = 253
+  let count = size - start
+  for (position, length) in [(-1, 0), (0, -1), (size + 1, 0), (start, count + 1)] {
+    do {
+      try source.copy(from: position, length: length, to: output)
+      expect(false)
+    } catch error {
+      expect(error.message == "音频数据长度超出文件范围")
+    }
+  }
+  try source.copy(from: size, length: 0, to: output)
+  // Start off the key-period boundary and write two full chunks plus a short tail.
+  try source.copy(from: start, length: count, to: output)
+  try output.close()
+  expect(try fs.read(path) == expected.slice(start, size))
+}

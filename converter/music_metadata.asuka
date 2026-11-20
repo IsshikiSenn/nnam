@@ -1,0 +1,46 @@
+import std/json
+
+pub struct NcmMetadata {
+  musicName: string = ""
+  artists: [string] = []
+  album: string = ""
+
+  fn tags() -> [string: string] {
+    var tags: [string: string] = [:]
+    if !musicName.isEmpty() { tags["TITLE"] = musicName }
+    if !artists.isEmpty() { tags["ARTIST"] = artists.joined(separator: " / ") }
+    if !album.isEmpty() { tags["ALBUM"] = album }
+    return tags
+  }
+}
+
+struct NcmTextFields {
+  musicName: string?
+  album: string?
+  artist: json.Value
+}
+
+struct NcmCover {
+  offset: int
+  length: int
+  mime: string
+}
+
+fn parseMusicMetadata(text: string) throws -> NcmMetadata {
+  let fields: NcmTextFields = try json.decode(text)
+  let artists = (fields.artist.asArray() ?? []).compactMap(entry => {
+    let name = entry.at(0)?.asString()
+    return if name == "" { none } else { name }
+  })
+  return NcmMetadata(musicName: fields.musicName ?? "", artists: artists, album: fields.album ?? "")
+}
+
+fn embeddedCover(signature: bytes, offset: int, length: int) -> NcmCover? {
+  if signature.count() >= 3 && signature.slice(0, 3) == bytes([0xff, 0xd8, 0xff]) {
+    return NcmCover(offset: offset, length: length, mime: "image/jpeg")
+  }
+  if signature == bytes([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {
+    return NcmCover(offset: offset, length: length, mime: "image/png")
+  }
+  return none
+}

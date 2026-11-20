@@ -1,0 +1,92 @@
+import std/crypto
+import std/encoding
+import std/fs
+
+test "NCM worker streams MP3 and cover bytes across file windows" {
+  let folder = fs.join([fs.tempDir(), "nnam-test-{crypto.uuid()}"])
+  try fs.mkdirAll(folder)
+  defer { try? fs.removeAll(folder) }
+  let input = fs.join([folder, "跨分块.ncm"])
+  let output = fs.join([folder, "跨分块.mp3"])
+  var frames = mpeg25Frame(1)
+  // Two full audio chunks and a short tail, starting after an existing ID3 header.
+  for _ in 0..<11 { frames = frames.concat(frames) }
+  let audio = testId3Header(4, length: 0).concat(frames)
+  let cover = bytes([0xff, 0xd8, 0xff]).concat("x".repeat(chunkSize).bytes())
+  let contents = try validationNcm(audio, cover: cover, coverPadding: 17)
+  try fs.write(input, data: contents)
+
+  let converter = NcmConverter()
+  let summary = try await converter.open(input)
+  expect(summary.format == "mp3")
+  expect(summary.byteCount == audio.count())
+  expect(summary.hasCover)
+  let exported = try await converter.exportAudio(output)
+  expect(exported.warnings.isEmpty())
+  expect(exported.inputByteCount == contents.count())
+
+  let picture = bytes([0]).concat("image/jpeg".bytes()).concat(bytes([0, 3, 0])).concat(cover)
+  let tag = id3Frame("APIC", payload: picture, version: 4)
+  expect(try fs.read(output) == testId3Header(4, length: tag.count()).concat(tag).concat(frames))
+  expect((try fs.readDir(folder)).count() == 2)
+}
+
+test "NCM worker rejects a changed source and keeps the existing export" {
+  let folder = fs.join([fs.tempDir(), "nnam-test-{crypto.uuid()}"])
+  try fs.mkdirAll(folder)
+  defer { try? fs.removeAll(folder) }
+  let input = fs.join([folder, "original.ncm"])
+  let output = fs.join([folder, "output.mp3"])
+  let frame = mpeg25Frame(1)
+  let contents = try validationNcm(frame)
+  let original = "existing output".bytes()
+  try fs.write(input, data: contents)
+  try fs.write(output, data: original)
+
+  let converter = NcmConverter()
+  try await converter.open(input)
+  try fs.write(input, data: bytes())
+  expect((try? await converter.exportAudio(output)) == none)
+  expect(try fs.read(output) == original)
+  expect((try fs.readDir(folder)).count() == 2)
+
+  try fs.write(input, data: contents)
+  try await converter.open(input)
+  let occupied = fs.join([folder, "occupied.mp3"])
+  try fs.mkdirAll(occupied)
+  expect((try? await converter.exportAudio(occupied)) == none)
+  expect((try fs.readDir(folder)).count() == 3)
+
+  try await converter.exportAudio(output)
+  expect(try fs.read(output) == frame)
+}
+
+test "NCM worker cleans up a partially written export and keeps the existing file" {
+  let folder = fs.join([fs.tempDir(), "nnam-test-{crypto.uuid()}"])
+  try fs.mkdirAll(folder)
+  defer { try? fs.removeAll(folder) }
+  let input = fs.join([folder, "track.ncm"])
+  let output = fs.join([folder, "track.flac"])
+  let original = "existing output".bytes()
+  let flac = try encoding.hexDecode(threeFlacFrames)
+  let streamInfo = flac.slice(0, 4).concat(bytes([0])).concat(flac.slice(5, 42))
+  // The outer block is valid, but the vendor length exceeds the comment payload.
+  let invalidComment = try encoding.hexDecode("8400000405000000")
+  let audio = streamInfo.concat(invalidComment).concat(flac.slice(42, flac.count()))
+  let metadata = try encoding.hexDecode(recoveredTitleMetadata)
+  try fs.write(input, data: validationNcm(audio, metadata: metadata))
+  try fs.write(output, data: original)
+
+  let converter = NcmConverter()
+  let summary = try await converter.open(input)
+  expect(summary.format == "flac")
+  expect(summary.metadata != none)
+  do {
+    try await converter.exportAudio(output)
+    expect(false)
+  } catch error {
+    expect(error.message == "文件不完整或数据段长度无效")
+  }
+  expect(try fs.read(output) == original)
+  expect((try fs.readDir(folder)).count() == 2)
+}

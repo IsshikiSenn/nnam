@@ -1,0 +1,262 @@
+import std/fs
+import ./converter.{NcmBatchResult, NcmSummary}
+
+component WorkspaceContent(flow: WorkspaceFlow, dragOver: bool) {
+  let activity = flow.activity()
+
+  Scroll {
+    grow: 1
+    minHeight: 0
+    Column {
+      padding: 24
+      gap: 16
+
+      if dragOver {
+        Text("松开以导入 NCM 文件")
+      }
+
+      match flow.page {
+        .importFiles => {
+          if activity.isEmpty() {
+            Column {
+              gap: 8
+              Text("拖入 NCM 文件") {
+                font: .title
+                role: .header
+                label: "拖入 NCM 文件"
+              }
+              Text("可一次拖入多个文件，导出原始 FLAC 或 MP3 音频和可用的歌曲标签。")
+            }
+          }
+        }
+        .track(input) => TrackDetails(input)
+        .batchProgress(_, progress) => BatchProgressDetails(progress)
+        .batchResults(_, result) => {
+          Column {
+            gap: 8
+            Text("批量导出结果") {
+              font: .title
+              role: .header
+              label: "批量导出结果"
+            }
+            StatusFeedback(result.summary)
+          }
+        }
+      }
+
+      if !activity.isEmpty() {
+        Row {
+          gap: 8
+          align: .center
+          if !environment().reduceMotion {
+            Activity { a11yHidden: true }
+          }
+          Text(activity) { shrink: 1 }
+        }
+      } else if let feedback = flow.feedback {
+        StatusFeedback(feedback)
+      }
+
+      if let result = flow.page.batchResult() {
+        BatchReport(result.items)
+      }
+    }
+  }
+}
+
+component WorkspaceActions(flow: WorkspaceFlow) {
+  event choose
+  event batch
+  event save
+  event reveal
+  event back
+
+  let busy = flow.isBusy()
+  let track = flow.page.trackOnPage()
+  let returnLabel = flow.page.returnLabel()
+  let destination = flow.destination()
+
+  Row {
+    padding: [12, 24]
+    gap: 8
+    wrap: true
+    justify: .spaceBetween
+
+    Row {
+      gap: 8
+      wrap: true
+      maxWidth: 100%
+      Button("选择 NCM 文件…") {
+        variant: if track == none && returnLabel == none { .filled } else { .bordered }
+        tooltip: if @platform == .macOS { "选择 NCM 文件（⌘O）" } else { "选择 NCM 文件" }
+        disabled: busy
+        on press { emit choose }
+      }
+      Button("批量导出…") {
+        variant: .bordered
+        tooltip: if @platform == .macOS { "批量导出（⌘B）" } else { "批量导出" }
+        disabled: busy
+        on press { emit batch }
+      }
+    }
+
+    if track != none || returnLabel != none {
+      Row {
+        gap: 8
+        wrap: true
+        maxWidth: 100%
+        if let label = returnLabel {
+          Button(label) {
+            variant: .bordered
+            disabled: busy
+            on press { emit back }
+          }
+        }
+        if @platform == .macOS {
+          if let target = destination {
+            Button(target.buttonTitle()) {
+              variant: if returnLabel != none { .filled } else { .bordered }
+              disabled: busy
+              on press { emit reveal }
+            }
+          }
+        }
+        if let input = track {
+          Button("导出 {input.format.upper()}…") {
+            variant: .filled
+            tooltip: if @platform == .macOS { "导出 {input.format.upper()}（⌘S）" } else { "导出 {input.format.upper()}" }
+            disabled: flow.exportableTrack() == none
+            on press { emit save }
+          }
+        }
+      }
+    }
+  }
+}
+
+extend ExportDestination {
+  fn buttonTitle() -> string = match self {
+    .file(_) => "在 Finder 中显示"
+    .folder(_) => "打开导出文件夹"
+  }
+}
+
+component TrackDetails(input: NcmSummary) {
+  let song = input.metadata?.musicName ?? ""
+  let artist = input.metadata?.artists.joined(separator: " / ") ?? ""
+  let album = input.metadata?.album ?? ""
+  let title = if song.isEmpty() { input.name } else { song }
+  let fileSize = "{float(input.byteCount) / 1_048_576.0:.2f} MiB"
+
+  Column {
+    gap: 16
+    Column {
+      gap: 4
+      Text(title) {
+        font: .title
+        role: .header
+        label: title
+        selectable: true
+      }
+      if title != input.name {
+        Text(input.name) { selectable: true }
+      }
+    }
+
+    Column {
+      gap: 8
+      TrackField("歌手", if artist.isEmpty() { "未提供" } else { artist })
+      TrackField("专辑", if album.isEmpty() { "未提供" } else { album })
+      TrackField("音频", "{input.format.upper()} · {fileSize}")
+      TrackField("封面", if input.hasCover { "含内嵌封面" } else { "无内嵌封面" })
+    }
+
+    if let warning = input.metadataWarning {
+      Text(warning)
+    }
+  }
+}
+
+component TrackField(name: string, value: string) {
+  Row {
+    gap: 12
+    Text(name) { font: .headline }
+    Text(value) {
+      grow: 1
+      minWidth: 0
+      selectable: true
+    }
+  }
+}
+
+component StatusFeedback(feedback: ExportFeedback) {
+  Column {
+    gap: 4
+    Text(feedback.message) {
+      font: .headline
+      selectable: true
+    }
+    for (index, detail) in feedback.details.enumerated() key index {
+      Text(detail) { selectable: true }
+    }
+  }
+}
+
+component BatchProgressDetails(progress: BatchProgress) {
+  let completed = progress.succeeded + progress.failed
+  let countLabel = "已处理 {completed} / {progress.total} 个文件"
+
+  Column {
+    gap: 12
+    Text("正在批量导出") {
+      font: .title
+      role: .header
+      label: "正在批量导出"
+    }
+    Progress {
+      value: float(completed) / float(progress.total)
+      label: "批量导出进度"
+      a11yValue: countLabel
+    }
+    Text(countLabel)
+    Text("成功 {progress.succeeded} 个 · 失败 {progress.failed} 个")
+
+    if !progress.active.isEmpty() {
+      Column {
+        gap: 4
+        Text("正在处理") { font: .headline }
+        for file in progress.active key file.index {
+          Text(fs.base(file.path)) {
+            selectable: true
+            tooltip: file.path
+          }
+        }
+      }
+    }
+  }
+}
+
+component BatchReport(items: [NcmBatchResult]) {
+  Column {
+    gap: 16
+    for (index, item) in items.enumerated() key (index, item.input) {
+      Column {
+        gap: 4
+        Text(fs.base(item.input)) {
+          font: .headline
+          selectable: true
+          tooltip: item.input
+        }
+        match item.outcome {
+          .exported(result) => {
+            Text("已导出 {fs.base(result.destination)}") { selectable: true }
+            for (warningIndex, warning) in result.warnings.enumerated() key warningIndex {
+              Text(warning) { selectable: true }
+            }
+          }
+          .failed(reason) => Text("导出失败：{reason}") { selectable: true }
+        }
+      }
+    }
+  }
+}

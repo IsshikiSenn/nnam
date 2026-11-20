@@ -1,0 +1,167 @@
+import std/fs
+import ./converter.{NcmBatchEvent, NcmBatchResult, NcmExportResult, NcmSummary}
+
+enum ExportDestination {
+  file(string)
+  folder(string)
+}
+
+struct ExportFeedback {
+  message: string
+  details: [string] = []
+  destination: ExportDestination? = none
+}
+
+struct WorkspaceBatchResult {
+  items: [NcmBatchResult]
+  summary: ExportFeedback
+}
+
+enum WorkspacePage {
+  importFiles
+  track(NcmSummary)
+  batchProgress(retainedTrack: NcmSummary?, progress: BatchProgress)
+  batchResults(retainedTrack: NcmSummary?, result: WorkspaceBatchResult)
+
+  fn returnLabel() -> string? = match self {
+    .batchResults(retainedTrack, _) => if retainedTrack == none { "返回导入" } else { "返回曲目" }
+    _ => none
+  }
+
+  fn trackOnPage() -> NcmSummary? = match self {
+    .track(input) => input
+    _ => none
+  }
+
+  fn retainedTrack() -> NcmSummary? = match self {
+    .importFiles => none
+    .track(input) => input
+    .batchProgress(input, _) => input
+    .batchResults(input, _) => input
+  }
+
+  fn batchResult() -> WorkspaceBatchResult? = match self {
+    .batchResults(_, result) => result
+    _ => none
+  }
+}
+
+enum WorkspaceOperation {
+  choosing
+  reading
+  exporting
+  exportingBatch
+}
+
+struct WorkspaceFlow {
+  page: WorkspacePage = .importFiles
+  operation: WorkspaceOperation? = none
+  feedback: ExportFeedback? = none
+
+  fn isBusy() -> bool = operation != none
+
+  fn activity() -> string = match operation {
+    .reading => "正在读取 NCM 文件…"
+    .exporting => "正在解密并导出…"
+    _ => ""
+  }
+
+  fn exportableTrack() -> NcmSummary? = if isBusy() { none } else { page.trackOnPage() }
+
+  fn destination() -> ExportDestination? {
+    if let result = page.batchResult() { return result.summary.destination }
+    return feedback?.destination
+  }
+
+  mut fn beginChoosing() { operation = .choosing }
+
+  mut fn beginReading() {
+    operation = .reading
+    page = .importFiles
+    feedback = none
+  }
+
+  mut fn finishReading(input: NcmSummary) { page = .track(input) }
+
+  mut fn beginExport() {
+    operation = .exporting
+    feedback = none
+  }
+
+  mut fn finishExport(result: NcmExportResult) -> ExportFeedback {
+    let report = ExportFeedback(message: "已导出 {fs.base(result.destination)}",
+      details: result.warnings, destination: .file(result.destination))
+    feedback = report
+    return report
+  }
+
+  mut fn reportError(message: string, recovery: string) -> ExportFeedback {
+    let report = ExportFeedback(message: message, details: if recovery.isEmpty() { [] } else { [recovery] })
+    feedback = report
+    return report
+  }
+
+  mut fn beginBatch(total: int) {
+    let input = page.retainedTrack()
+    operation = .exportingBatch
+    page = .batchProgress(retainedTrack: input, progress: BatchProgress(total: total))
+    feedback = none
+  }
+
+  mut fn updateBatch(event: NcmBatchEvent) {
+    let .batchProgress(input, current) = page else { return }
+    var progress = current
+    progress.apply(event)
+    page = .batchProgress(retainedTrack: input, progress: progress)
+  }
+
+  mut fn finishBatch(items: [NcmBatchResult], folder: string) -> ExportFeedback? {
+    let .batchProgress(input, _) = page else { return none }
+    let succeeded = items.count(item => item.outcome.succeeded())
+    let failed = items.count() - succeeded
+    let summary = ExportFeedback(message: "批量导出完成，成功 {succeeded} 个，失败 {failed} 个",
+      details: if failed == 0 { [] } else { ["请查看失败原因，处理后可重新选择这些文件导出。"] },
+      destination: if succeeded > 0 { .folder(folder) } else { none })
+    let result = WorkspaceBatchResult(items: items, summary: summary)
+    page = .batchResults(retainedTrack: input, result: result)
+    return summary
+  }
+
+  mut fn endOperation() {
+    operation = none
+    if let .batchProgress(input, _) = page { restoreTrack(input) }
+  }
+
+  mut fn leaveBatchResults() {
+    if isBusy() { return }
+    let .batchResults(input, _) = page else { return }
+    restoreTrack(input)
+    feedback = none
+  }
+
+  mut fn restoreTrack(input: NcmSummary?) {
+    page = if let track = input { .track(track) } else { .importFiles }
+  }
+}
+
+struct ActiveBatchFile {
+  index: int
+  path: string
+}
+
+struct BatchProgress {
+  total: int
+  succeeded: int = 0
+  failed: int = 0
+  active: [ActiveBatchFile] = []
+
+  mut fn apply(event: NcmBatchEvent) {
+    match event {
+      .started(index, input) => { active.push(ActiveBatchFile(index: index, path: input)) }
+      .finished(index, outcome) => {
+        active.removeWhere(item => item.index == index)
+        if outcome.succeeded() { succeeded += 1 } else { failed += 1 }
+      }
+    }
+  }
+}

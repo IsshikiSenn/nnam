@@ -1,0 +1,95 @@
+struct FlacBlock {
+  kind: int
+  offset: int
+  length: int
+}
+
+fn writeFlacAudio(source: AudioSource, tags: [string: string], cover: NcmCover?, destination: StreamOutput) throws {
+  let position = if tags.isEmpty() && cover == none {
+    0
+  } else {
+    try writeFlacMetadata(source, tags: tags, cover: cover, destination: destination)
+  }
+  try source.copy(from: position, length: source.count() - position, to: destination)
+}
+
+// Rewrite the metadata chain and return the start of the original audio frames.
+fn writeFlacMetadata(source: AudioSource, tags: [string: string], cover: NcmCover?, destination: StreamOutput) throws -> int {
+  let metadata = try readFlacMetadata(source)
+  let blocks = try metadata.blocks.filter(block => {
+    if block.kind != 6 || cover == none || block.length < 4 { return true }
+    // Replace the front cover while preserving any other pictures.
+    return (try source.read(block.offset, length: 4)) != big32(3)
+  })
+  let addComments = !tags.isEmpty() && !blocks.any(block => block.kind == 4)
+
+  try destination.write("fLaC".bytes())
+  for (index, block) in blocks.enumerated() {
+    let last = index == blocks.count() - 1 && !addComments && cover == none
+    if block.kind == 4 && !tags.isEmpty() {
+      let original = try source.read(block.offset, length: block.length)
+      let updated = try updateFlacComments(original, tags: tags)
+      try writeFlacBlockHeader(destination, kind: block.kind, length: updated.count(), last: last)
+      try destination.write(updated)
+    } else {
+      try writeFlacBlockHeader(destination, kind: block.kind, length: block.length, last: last)
+      try source.copy(from: block.offset, length: block.length, to: destination)
+    }
+  }
+
+  if addComments {
+    let payload = try updateFlacComments(bytes(), tags: tags)
+    try writeFlacBlockHeader(destination, kind: 4, length: payload.count(), last: cover == none)
+    try destination.write(payload)
+  }
+  if let cover = cover {
+    let picture = flacPicturePrefix(cover)
+    try writeFlacBlockHeader(destination, kind: 6, length: picture.count() + cover.length, last: true)
+    try destination.write(picture)
+    try source.copyCover(cover, to: destination)
+  }
+  return metadata.audioStart
+}
+
+fn writeFlacBlockHeader(output: StreamOutput, kind: int, length: int, last: bool) throws {
+  if length > 0xff_ffff { throw Error("FLAC 标签或封面超出格式大小限制") }
+  let flag = if last { 0x80 } else { 0 }
+  try output.write(big32(((flag | kind) << 24) | length))
+}
+
+fn updateFlacComments(original: bytes, tags: [string: string]) throws -> bytes {
+  var vendor = "nnam".bytes()
+  var comments: [bytes] = []
+  if !original.isEmpty() {
+    var reader = BinaryReader(input: .memory(original))
+    let vendorLength = try reader.readLength()
+    vendor = try reader.read(vendorLength)
+    let count = try reader.readLength()
+    if count > maxTagRecords || count > (original.count() - reader.offset) / 4 {
+      throw Error("FLAC 注释条目过多或长度无效")
+    }
+    for _ in 0..<count {
+      let size = try reader.readLength()
+      let comment = try reader.read(size)
+      let key = comment.string().split("=", count: 2).first() ?? ""
+      if !tags.has(key.upper()) { comments.push(comment) }
+    }
+  }
+  for (key, value) in tags {
+    comments.push("{key}={value}".bytes())
+  }
+
+  var result = little32(vendor.count()).concat(vendor).concat(little32(comments.count()))
+  for comment in comments {
+    result = result.concat(little32(comment.count())).concat(comment)
+  }
+  return result
+}
+
+fn flacPicturePrefix(cover: NcmCover) -> bytes {
+  let mime = cover.mime.bytes()
+  // Front cover, MIME type, empty description, unspecified dimensions and depth.
+  return big32(3).concat(big32(mime.count())).concat(mime)
+    .concat(bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+    .concat(big32(cover.length))
+}

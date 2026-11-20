@@ -1,0 +1,187 @@
+let mpeg1Layer3Rates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
+let mpeg2Layer3Rates = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+let mpeg1SampleRates = [44100, 48000, 32000]
+// The largest supported frame is 1440 bytes plus one byte of padding.
+let maxMp3FrameLength = 1441
+
+enum Mp3TagDisposition {
+  merge
+  preserve
+  replaceDamaged
+}
+
+struct Mp3Layout {
+  audioStart: int
+  id3Version: int = 4
+  frames: [Id3Frame] = []
+  tagDisposition: Mp3TagDisposition = .merge
+}
+
+fn matchesId3Footer(source: AudioSource, at: int, header: bytes) throws -> bool {
+  if source.count() - at < 10 { return false }
+  let footer = try source.read(at, length: 10)
+  return footer.slice(0, 3) == "3DI".bytes() && footer.slice(3, 6) == header.slice(3, 6) &&
+    (try? readSynchsafe(footer, at: 6)) == at - 10
+}
+
+fn mp3AudioEnd(source: AudioSource) throws -> int {
+  var end = source.count()
+  if end >= 128 && (try source.read(end - 128, length: 3)) == "TAG".bytes() {
+    end -= 128
+  }
+  if end < 32 { return end }
+  let footer = try source.read(end - 32, length: 32)
+  if footer.slice(0, 8) != "APETAGEX".bytes() { return end }
+  let size = readLittle32(footer, at: 12)
+  let itemCount = readLittle32(footer, at: 16)
+  let flags = readLittle32(footer, at: 20)
+  let headerSize = if (flags & 0x8000_0000) != 0 { 32 } else { 0 }
+  // An item needs a value length, flags, and at least a two-byte key with its terminator.
+  if readLittle32(footer, at: 8) != 2000 || size < 32 || size + headerSize > end ||
+    itemCount > (size - 32) / 11 || (flags & 0x6000_0000) != 0 {
+    throw Error("MP3 的 APEv2 尾标签无效")
+  }
+  let tagStart = end - size - headerSize
+  if headerSize == 32 {
+    let header = try source.read(tagStart, length: 32)
+    if header.slice(0, 20) != footer.slice(0, 20) ||
+      readLittle32(header, at: 20) != (flags | 0x2000_0000) {
+      throw Error("MP3 的 APEv2 尾标签头无效")
+    }
+  }
+  return tagStart
+}
+
+fn inspectMp3(source: AudioSource, hasTag: bool) throws -> Mp3Layout {
+  let end = try mp3AudioEnd(source)
+  if !hasTag {
+    try validateMp3Frames(source, start: 0, end: end)
+    return Mp3Layout(audioStart: 0)
+  }
+
+  if end < 10 { throw Error("MP3 的 ID3 标签头不完整") }
+  let header = try source.read(0, length: 10)
+  let version = header[3]
+  let flags = header[5]
+  if version < 2 || version > 4 || header[4] == 0xff {
+    throw Error("MP3 的 ID3 标签版本不受支持")
+  }
+  let hasFooter = version == 4 && (flags & 0x10) != 0
+  let footerLength = if hasFooter { 10 } else { 0 }
+  let declaredSize = try? readSynchsafe(header, at: 6)
+  var declaredEnd: int? = none
+  if let size = declaredSize {
+    let tagEnd = 10 + size
+    if tagEnd + footerLength <= end && (!hasFooter || (try matchesId3Footer(source, at: tagEnd, header: header))) {
+      declaredEnd = tagEnd
+    }
+  }
+
+  // A tag-level transform can obscure its frame boundaries. Keep these tags
+  // verbatim when the declared boundary and audio are usable.
+  if flags != 0 && !(version == 4 && flags == 0x10) {
+    let tagEnd = declaredEnd else { throw Error("无法确认 MP3 音频起点，ID3 标签长度无效") }
+    let start = tagEnd + footerLength
+    try validateMp3Frames(source, start: start, end: end)
+    return Mp3Layout(audioStart: start, tagDisposition: .preserve)
+  }
+
+  if let tagEnd = declaredEnd {
+    let start = tagEnd + footerLength
+    let body = try readId3Body(source, header: header, limit: tagEnd)
+    if body.complete && body.end == tagEnd && (start == end || (try source.byteAt(start)) == 0xff) {
+      try validateMp3Frames(source, start: start, end: end)
+      return Mp3Layout(audioStart: start, id3Version: version, frames: body.frames,
+        tagDisposition: if version == 2 || hasFooter { .preserve } else { .merge })
+    }
+    if !body.complete && start < end && (try source.byteAt(start)) == 0xff {
+      do {
+        try validateMp3Frames(source, start: start, end: end)
+      } catch {
+        return try recoverMp3Layout(source, header: header, end: end)
+      }
+      try checkForPreviousMp3Frame(source, start: start, tagOffset: body.end)
+      return Mp3Layout(audioStart: start, tagDisposition: .replaceDamaged)
+    }
+  }
+
+  return try recoverMp3Layout(source, header: header, end: end)
+}
+
+fn recoverMp3Layout(source: AudioSource, header: bytes, end: int) throws -> Mp3Layout {
+  // Recover only at the end of a readable ID3 frame chain, padding or footer.
+  // A sync word at an arbitrary byte could be inside a tag or a later frame.
+  let body = try readId3Body(source, header: header, limit: end)
+  let hasFooter = header[3] == 4 && (header[5] & 0x10) != 0
+  let start = body.end + (if hasFooter { 10 } else { 0 })
+  if !body.complete || start >= end || (try source.byteAt(start)) != 0xff ||
+    (hasFooter && !(try matchesId3Footer(source, at: body.end, header: header))) {
+    throw Error("无法确认 MP3 音频起点，ID3 标签长度无效")
+  }
+  try validateMp3Frames(source, start: start, end: end)
+  try checkForPreviousMp3Frame(source, start: start, tagOffset: 10)
+  return Mp3Layout(audioStart: start, tagDisposition: .replaceDamaged)
+}
+
+fn checkForPreviousMp3Frame(source: AudioSource, start: int, tagOffset: int) throws {
+  // A valid suffix can begin at the second frame. Rule out a contiguous
+  // predecessor before removing bytes at a suspect tag boundary.
+  for candidate in max(tagOffset, start - maxMp3FrameLength)..<start {
+    if (try source.byteAt(candidate)) == 0xff &&
+      (try? mp3FrameLength(source, at: candidate, end: start, firstFrame: false)) == start - candidate {
+      throw Error("无法确认 MP3 音频起点，ID3 标签可能覆盖了音频帧")
+    }
+  }
+}
+
+fn validateMp3Frames(source: AudioSource, start: int, end: int) throws {
+  if start >= end { throw Error("MP3 没有音频帧") }
+
+  var position = start
+  while position < end {
+    position += try mp3FrameLength(source, at: position, end: end, firstFrame: position == start)
+  }
+}
+
+fn mp3FrameLength(source: AudioSource, at: int, end: int, firstFrame: bool) throws -> int {
+  let remaining = end - at
+  if remaining < 4 { throw Error("MP3 音频帧头不完整") }
+  let first = try source.byteAt(at)
+  let second = try source.byteAt(at + 1)
+  let third = try source.byteAt(at + 2)
+  let fourth = try source.byteAt(at + 3)
+  if firstFrame && first == 0xff && (second & 0xf6) == 0xf0 &&
+    ((third >> 2) & 0x0f) < 13 && remaining >= 7 {
+    let length = ((fourth & 3) << 11) | ((try source.byteAt(at + 4)) << 3) |
+      ((try source.byteAt(at + 5)) >> 5)
+    if length >= (if (second & 1) == 1 { 7 } else { 9 }) {
+      throw Error("检测到 ADTS AAC，目前不支持导出此格式")
+    }
+  }
+
+  let version = (second >> 3) & 3
+  let bitrateIndex = third >> 4
+  let rateIndex = (third >> 2) & 3
+  if first != 0xff || (second & 0xe6) != 0xe2 || version == 1 ||
+    bitrateIndex == 15 || rateIndex == 3 || (fourth & 3) == 2 {
+    if firstFrame { throw Error("解密后的音频没有有效的 MPEG Layer III 帧头") }
+    throw Error("MP3 音频帧头无效或包含未知的尾部数据")
+  }
+  if bitrateIndex == 0 { throw Error("目前不支持自由码率 MP3") }
+  let mpeg1 = version == 3
+  let divisor = if mpeg1 { 1 } else if version == 2 { 2 } else { 4 }
+  let sampleRate = mpeg1SampleRates[rateIndex] / divisor
+  let rate = if mpeg1 { mpeg1Layer3Rates[bitrateIndex] } else { mpeg2Layer3Rates[bitrateIndex] }
+  let samples = if mpeg1 { 144_000 } else { 72_000 }
+  let length = samples * rate / sampleRate + ((third >> 1) & 1)
+  let mono = (fourth >> 6) == 3
+  let sideInfo = if mpeg1 {
+    if mono { 17 } else { 32 }
+  } else {
+    if mono { 9 } else { 17 }
+  }
+  let crcLength = if (second & 1) == 0 { 2 } else { 0 }
+  if length < 4 + crcLength + sideInfo { throw Error("MP3 音频帧长度无效") }
+  if length > remaining { throw Error("MP3 音频帧被截断") }
+  return length
+}

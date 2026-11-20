@@ -1,0 +1,207 @@
+let mp3Fields = ["TIT2": "TITLE", "TPE1": "ARTIST", "TALB": "ALBUM"]
+
+struct Id3Frame {
+  id: string
+  offset: int
+  length: int
+  formatFlags: int
+}
+
+struct Id3Body {
+  end: int
+  frames: [Id3Frame] = []
+  complete: bool = true
+}
+
+fn readId3Body(source: AudioSource, header: bytes, limit: int) throws -> Id3Body {
+  let version = header[3]
+  let idLength = if version == 2 { 3 } else { 4 }
+  let frameHeaderLength = if version == 2 { 6 } else { 10 }
+  let hasFooter = version == 4 && (header[5] & 0x10) != 0
+  var frames: [Id3Frame] = []
+  var offset = 10
+  while offset < limit {
+    let first = try source.byteAt(offset)
+    if first == 0xff || (hasFooter && first == 0x33 && (try matchesId3Footer(source, at: offset, header: header))) {
+      break
+    }
+    if first == 0 {
+      offset = try skipId3Padding(source, from: offset, limit: limit)
+      if offset == limit || (try source.byteAt(offset)) == 0xff { break }
+      return Id3Body(end: offset, complete: false)
+    }
+    if limit - offset < frameHeaderLength { return Id3Body(end: offset, complete: false) }
+    let frame = try source.read(offset, length: frameHeaderLength)
+    let identifier = frame.slice(0, idLength)
+    for index in 0..<idLength {
+      let byte = identifier[index]
+      if !(byte >= 0x41 && byte <= 0x5a) && !(byte >= 0x30 && byte <= 0x39) {
+        return Id3Body(end: offset, complete: false)
+      }
+    }
+    let bodyLength: int? = if version == 2 {
+      (frame[3] << 16) | (frame[4] << 8) | frame[5]
+    } else if version == 4 {
+      try? readSynchsafe(frame, at: 4)
+    } else {
+      readBig32(frame, at: 4)
+    }
+    let size = bodyLength else { return Id3Body(end: offset, complete: false) }
+    if size == 0 || size > limit - offset - frameHeaderLength {
+      return Id3Body(end: offset, complete: false)
+    }
+    let length = frameHeaderLength + size
+    let formatFlags = if version == 2 { 0 } else { frame[9] }
+    if frames.count() == maxTagRecords { throw Error("MP3 标签帧过多") }
+    frames.push(Id3Frame(id: identifier.string(), offset: offset, length: length, formatFlags: formatFlags))
+    offset += length
+  }
+  return Id3Body(end: offset, frames: frames)
+}
+
+fn skipId3Padding(source: AudioSource, from: int, limit: int) throws -> int {
+  var offset = from
+  while offset < limit {
+    let window = try source.read(offset, length: min(chunkSize, limit - offset))
+    for index in 0..<window.count() {
+      if window[index] != 0 { return offset + index }
+    }
+    offset += window.count()
+  }
+  return offset
+}
+
+fn writeMp3Audio(source: AudioSource, layout: Mp3Layout, tags: [string: string], cover: NcmCover?, destination: StreamOutput) throws -> [string] {
+  let hasTags = !tags.isEmpty() || cover != none
+  let noWarnings: [string] = []
+  let (rewrite, position, warnings) = match layout.tagDisposition {
+    .merge => (hasTags, if hasTags { layout.audioStart } else { 0 }, noWarnings)
+    .preserve => (false, 0, if hasTags { ["已保留原有 ID3，未迁移 NCM 歌曲信息或封面"] } else { noWarnings })
+    .replaceDamaged => (hasTags, layout.audioStart, ["已移除损坏的 ID3 标签"])
+  }
+  if rewrite {
+    try writeMp3Tags(source, layout: layout, tags: tags, cover: cover, destination: destination)
+  }
+  try source.copy(from: position, length: source.count() - position, to: destination)
+  return warnings
+}
+
+fn writeMp3Tags(source: AudioSource, layout: Mp3Layout, tags: [string: string], cover: NcmCover?, destination: StreamOutput) throws {
+  let version = layout.id3Version
+  var frames: [Id3Frame] = []
+  for frame in layout.frames {
+    var replace = false
+    if let field = mp3Fields[frame.id] { replace = tags.has(field) }
+    let bodyLength = frame.length - 10
+    if frame.id == "APIC" && cover != none && frame.formatFlags == 0 && bodyLength > 3 {
+      let picture = try source.read(frame.offset + 10, length: min(256, bodyLength))
+      replace = isFrontCover(picture)
+    }
+    if !replace { frames.push(frame) }
+  }
+
+  var additions: [bytes] = []
+  for (identifier, field) in mp3Fields {
+    if let text = tags[field] {
+      let payload = if version == 4 {
+        bytes([3]).concat(text.bytes())
+      } else {
+        id3Utf16(text)
+      }
+      additions.push(id3Frame(identifier, payload: payload, version: version))
+    }
+  }
+  let picture = if let cover = cover {
+    bytes([0]).concat(cover.mime.bytes()).concat(bytes([0, 3, 0]))
+  } else {
+    bytes()
+  }
+  let pictureLength = picture.count() + (cover?.length ?? 0)
+  var size = 0
+  for frame in frames { size += frame.length }
+  for frame in additions { size += frame.count() }
+  if cover != none { size += 10 + pictureLength }
+  if size > 0x0fff_ffff { throw Error("MP3 标签或封面超出格式大小限制") }
+
+  let header = "ID3".bytes().concat(bytes([version, 0, 0])).concat(synchsafe(size))
+  try destination.write(header)
+  for frame in frames {
+    try source.copy(from: frame.offset, length: frame.length, to: destination)
+  }
+  for frame in additions {
+    try destination.write(frame)
+  }
+  if let cover = cover {
+    try destination.write(id3FrameHeader("APIC", length: pictureLength, version: version))
+    try destination.write(picture)
+    try source.copyCover(cover, to: destination)
+  }
+}
+
+fn isFrontCover(picture: bytes) -> bool {
+  // The MIME type is always a zero-terminated byte string after the encoding byte.
+  for index in 1..<(picture.count() - 1) {
+    if picture[index] == 0 { return picture[index + 1] == 3 }
+  }
+  return false
+}
+
+fn id3Frame(identifier: string, payload: bytes, version: int) -> bytes {
+  return id3FrameHeader(identifier, length: payload.count(), version: version).concat(payload)
+}
+
+fn id3FrameHeader(identifier: string, length: int, version: int) -> bytes {
+  let size = if version == 4 { synchsafe(length) } else { big32(length) }
+  return identifier.bytes().concat(size).concat(bytes([0, 0]))
+}
+
+fn readSynchsafe(data: bytes, at: int) throws -> int {
+  var size = 0
+  for index in at..<(at + 4) {
+    if data[index] > 0x7f { throw Error("MP3 标签长度编码无效") }
+    size = (size << 7) | data[index]
+  }
+  return size
+}
+
+fn synchsafe(size: int) -> bytes {
+  return bytes([(size >> 21) & 0x7f, (size >> 14) & 0x7f, (size >> 7) & 0x7f, size & 0x7f])
+}
+
+fn id3Utf16(text: string) -> bytes {
+  // ID3v2.3 uses UTF-16 with a BOM for Unicode text.
+  let input = text.bytes()
+  var result = [1, 0xff, 0xfe]
+  var offset = 0
+  while offset < input.count() {
+    let first = input[offset]
+    var value = first
+    var extra = 0
+    if first >= 0xf0 {
+      extra = 3
+      value = first & 0x07
+    } else if first >= 0xe0 {
+      extra = 2
+      value = first & 0x0f
+    } else if first >= 0xc0 {
+      extra = 1
+      value = first & 0x1f
+    }
+    for index in 0..<extra {
+      value = (value << 6) | (input[offset + index + 1] & 0x3f)
+    }
+    offset += 1 + extra
+    if value >= 0x10000 {
+      let high = 0xd800 | ((value - 0x10000) >> 10)
+      let low = 0xdc00 | ((value - 0x10000) & 0x3ff)
+      result.push(high & 0xff)
+      result.push(high >> 8)
+      result.push(low & 0xff)
+      result.push(low >> 8)
+    } else {
+      result.push(value & 0xff)
+      result.push(value >> 8)
+    }
+  }
+  return bytes(result)
+}

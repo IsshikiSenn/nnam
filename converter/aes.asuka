@@ -1,0 +1,43 @@
+// The C buffer stays on the thread that decrypted it. Copy its blocks into
+// Asuka bytes before the handle goes out of scope.
+extern type AesPlaintext with release nnam_aes128_ecb_free
+extern fn nnam_aes128_ecb_free(buffer: AesPlaintext)
+extern fn nnam_aes128_ecb_decrypt(key: bytes, ciphertext: bytes) -> AesPlaintext?
+extern fn nnam_aes128_ecb_block(buffer: AesPlaintext, offset: UInt64) -> AesBlock
+
+extern struct AesBlock {
+  first: UInt32
+  second: UInt32
+  third: UInt32
+  fourth: UInt32
+}
+
+fn aes128EcbDecrypt(key: bytes, ciphertext: bytes) throws -> bytes {
+  let buffer = nnam_aes128_ecb_decrypt(key, ciphertext) else {
+    throw Error("AES-128-ECB 无法解密此数据段")
+  }
+  var output: [int] = []
+  for blockIndex in 0..<(ciphertext.count() / 16) {
+    let block = nnam_aes128_ecb_block(buffer, blockIndex * 16)
+    for word in [block.first, block.second, block.third, block.fourth] {
+      for byteIndex in 0..<4 {
+        output.push((word >> (8 * byteIndex)) & 0xff)
+      }
+    }
+  }
+  return bytes(output)
+}
+
+fn removePkcs7(data: bytes) throws -> bytes {
+  let pad = data.get(data.count() - 1) ?? 0
+  if pad < 1 || pad > 16 || pad > data.count() {
+    throw Error("NCM 数据段的 AES 填充无效")
+  }
+  let end = data.count() - pad
+  for i in end..<data.count() {
+    if data[i] != pad {
+      throw Error("NCM 数据段的 AES 填充无效")
+    }
+  }
+  return data.slice(0, end)
+}

@@ -1,0 +1,201 @@
+struct FlacMetadataChain {
+  blocks: [FlacBlock]
+  audioStart: int
+  maximumFrameSize: int
+  totalSamples: int
+}
+
+fn readFlacMetadata(source: AudioSource) throws -> FlacMetadataChain {
+  var blocks: [FlacBlock] = []
+  var position = 4
+  while true {
+    if source.count() - position < 4 { throw Error("FLAC 元数据块头不完整") }
+    let header = try source.read(position, length: 4)
+    let kind = header[0] & 0x7f
+    let length = (header[1] << 16) | (header[2] << 8) | header[3]
+    let offset = position + 4
+    if (position == 4 && (kind != 0 || length != 34)) || (position != 4 && kind == 0) {
+      throw Error("FLAC 的 STREAMINFO 元数据块无效")
+    }
+    if kind == 127 || length > source.count() - offset { throw Error("FLAC 元数据块无效或被截断") }
+    if blocks.count() == maxTagRecords { throw Error("FLAC 元数据块过多") }
+    blocks.push(FlacBlock(kind: kind, offset: offset, length: length))
+    position = offset + length
+    if (header[0] & 0x80) != 0 { break }
+  }
+  let info = try source.read(8, length: 34)
+  let maximumFrameSize = (info[7] << 16) | (info[8] << 8) | info[9]
+  let totalSamples = ((info[13] & 0x0f) << 32) | readBig32(info, at: 14)
+  return FlacMetadataChain(blocks: blocks, audioStart: position,
+    maximumFrameSize: maximumFrameSize, totalSamples: totalSamples)
+}
+
+struct FlacFrameHeader {
+  number: int
+  samples: int
+  variableBlocks: bool
+  minimumSize: int
+}
+
+let flacNumberMinimums = [0, 0, 0x80, 0x800, 0x1_0000, 0x20_0000, 0x400_0000, 0x8000_0000]
+
+fn flacFrameHeader(source: AudioSource, at: int) throws -> FlacFrameHeader? {
+  let length = min(16, source.count() - at)
+  if length < 6 { return none }
+  let header = try source.read(at, length: length)
+  if header[0] != 0xff || (header[1] & 0xfe) != 0xf8 { return none }
+  let variableBlocks = (header[1] & 1) != 0
+  let blockCode = header[2] >> 4
+  let rateCode = header[2] & 0x0f
+  let channels = header[3] >> 4
+  let depthCode = (header[3] >> 1) & 7
+  if blockCode == 0 || rateCode == 15 || channels > 10 || depthCode == 3 || (header[3] & 1) != 0 {
+    return none
+  }
+
+  let lead = header[4]
+  var numberLength = 1
+  var number = lead
+  if lead >= 0x80 {
+    var mask = 0x80
+    numberLength = 0
+    while (lead & mask) != 0 {
+      numberLength += 1
+      mask = mask >> 1
+    }
+    if numberLength < 2 || numberLength > (if variableBlocks { 7 } else { 6 }) ||
+      4 + numberLength >= length { return none }
+    number = lead & (mask - 1)
+    for index in 5..<(4 + numberLength) {
+      let part = header[index]
+      if (part & 0xc0) != 0x80 { return none }
+      number = (number << 6) | (part & 0x3f)
+    }
+    if number < flacNumberMinimums[numberLength] { return none }
+  }
+
+  var position = 4 + numberLength
+  let samples = if blockCode == 1 {
+    192
+  } else if blockCode < 6 {
+    576 << (blockCode - 2)
+  } else if blockCode < 8 {
+    let extra = blockCode - 5
+    if position + extra >= length { return none }
+    var value = header[position]
+    if extra == 2 { value = (value << 8) | header[position + 1] }
+    position += extra
+    value + 1
+  } else {
+    256 << (blockCode - 8)
+  }
+  if samples > 65535 { return none }
+  if rateCode >= 12 {
+    let extra = if rateCode == 12 { 1 } else { 2 }
+    if position + extra >= length { return none }
+    if header[position] == 0 && (extra == 1 || header[position + 1] == 0) { return none }
+    position += extra
+  }
+  var crc = 0
+  for index in 0..<position {
+    crc = crc ^ header[index]
+    for _ in 0..<8 {
+      let polynomial = if (crc & 0x80) != 0 { 0x07 } else { 0 }
+      crc = ((crc << 1) & 0xff) ^ polynomial
+    }
+  }
+  if crc != header[position] { return none }
+  let channelCount = if channels < 8 { channels + 1 } else { 2 }
+  return FlacFrameHeader(number: number, samples: samples, variableBlocks: variableBlocks,
+    minimumSize: position + 1 + channelCount + 2)
+}
+
+// Reversing the same CRC update from zero at EOF checks each possible suffix in one pass.
+fn makeFlacCrc16Table(reverse: bool) -> [int] {
+  var table: [int] = []
+  for byte in 0..<256 {
+    var crc = if reverse { byte } else { byte << 8 }
+    for _ in 0..<8 {
+      if reverse {
+        let high = crc & 1
+        crc = ((crc ^ (high * 0x8005)) >> 1) | (high << 15)
+      } else {
+        let polynomial = if (crc & 0x8000) != 0 { 0x8005 } else { 0 }
+        crc = ((crc << 1) & 0xffff) ^ polynomial
+      }
+    }
+    table.push(crc)
+  }
+  return table
+}
+
+let flacCrc16Forward = makeFlacCrc16Table(false)
+let flacCrc16Reverse = makeFlacCrc16Table(true)
+
+fn validateFlac(source: AudioSource) throws {
+  let metadata = try readFlacMetadata(source)
+  let start = metadata.audioStart
+  let end = source.count()
+  if start == end { throw Error("FLAC 没有音频帧") }
+  let first = try flacFrameHeader(source, at: start) else { throw Error("FLAC 首帧头无效或被截断") }
+  if first.number != 0 { throw Error("FLAC 首帧编号无效") }
+  let limit = if metadata.maximumFrameSize > 0 { metadata.maximumFrameSize } else { 16 * 1024 * 1024 }
+  let firstEnd = try findFlacFirstFrameEnd(source, start: start, first: first, limit: limit)
+  let last = if firstEnd == end {
+    first
+  } else {
+    try findFlacLastFrame(source, earliest: firstEnd, first: first, limit: limit)
+  }
+  let lastSample = if first.variableBlocks { last.number } else { last.number * first.samples }
+  if metadata.totalSamples != 0 && lastSample + last.samples != metadata.totalSamples {
+    throw Error("FLAC 音频帧与声明的总样本数不符，文件可能被截断")
+  }
+}
+
+fn findFlacFirstFrameEnd(source: AudioSource, start: int, first: FlacFrameHeader, limit: int) throws -> int {
+  let end = source.count()
+  let stop = start + min(end - start, limit)
+  let nextNumber = if first.variableBlocks { first.samples } else { 1 }
+  var crc = 0
+  var position = start
+  while position < stop {
+    let window = try source.read(position, length: min(chunkSize, stop - position))
+    for index in 0..<window.count() {
+      crc = ((crc << 8) & 0xffff) ^ flacCrc16Forward[(crc >> 8) ^ window[index]]
+      let candidate = position + index + 1
+      if crc == 0 && candidate - start >= first.minimumSize {
+        if candidate == end { return candidate }
+        if let next = try flacFrameHeader(source, at: candidate) {
+          if next.number == nextNumber && next.variableBlocks == first.variableBlocks { return candidate }
+        }
+      }
+    }
+    position += window.count()
+  }
+  if stop < end { throw Error("FLAC 首帧无效或超出帧长校验范围") }
+  throw Error("FLAC 首帧校验失败或被截断")
+}
+
+fn findFlacLastFrame(source: AudioSource, earliest: int, first: FlacFrameHeader, limit: int) throws -> FlacFrameHeader {
+  let end = source.count()
+  let stop = max(earliest, end - limit)
+  let nextNumber = if first.variableBlocks { first.samples } else { 1 }
+  var position = end
+  var crc = 0
+  while position > stop {
+    let windowStart = max(stop, position - chunkSize)
+    let window = try source.read(windowStart, length: position - windowStart)
+    while position > windowStart {
+      position -= 1
+      crc = (crc >> 8) ^ flacCrc16Reverse[crc & 0xff] ^ (window[position - windowStart] << 8)
+      if crc == 0 {
+        if let last = try flacFrameHeader(source, at: position) {
+          if end - position >= last.minimumSize && last.variableBlocks == first.variableBlocks &&
+            last.number >= nextNumber { return last }
+        }
+      }
+    }
+  }
+  if stop > earliest { throw Error("FLAC 末帧无效、被截断或超出帧长校验范围") }
+  throw Error("FLAC 末帧校验失败或被截断")
+}

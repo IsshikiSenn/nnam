@@ -1,0 +1,16 @@
+# The app, as the platforms and the stores know it: every key is in
+# Asuka's docs (https://asuka.egoist.dev/docs/asuka-toml).
+name = "nnam"
+id = "com.isshikisenn.nnam"
+version = "0.0.1"
+build = 1
+orientations = ["portrait", "landscape"]
+
+[[fileTypes]]
+name = "NCM 音频文件"
+extensions = ["ncm"]
+role = "viewer"
+
+[c]
+# List the C sources here for app builds that import ./converter.
+sources = ["converter/c/*.c"]

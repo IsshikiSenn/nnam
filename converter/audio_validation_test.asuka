@@ -1,0 +1,255 @@
+import std/crypto
+import std/encoding
+import std/fs
+
+// Small FFmpeg FLAC fixtures with only STREAMINFO, zero MD5 and unknown maximum frame size.
+let oneFlacFrame = "664c614380000022040004000000000008150ac440f00000001800000000000000000000000000000000fff86908001778000000e2de"
+let threeFlacFrames = "664c614380000022040004000000000008150ac440f00000083400000000000000000000000000000000fff8a9080050000000039ffff8a90801570000006fe7fff869080233ae000000a419"
+
+// Wrapped, encrypted NCM metadata with the title "Recovered 曲名".
+let recoveredTitleMetadata =
+  "5255504308061a4b270c0d4417430e0c070a051a4a592e0148124c2529120a57323101242425515b040c065a392c2d572d502d3b30362e57312c3a2b3048140d05330131202737512c500212241650090a342b57015b"
+
+fn validationNcm(payload: bytes, metadata: bytes = bytes(), cover: bytes = bytes(), coverPadding: int = 0) throws -> bytes {
+  let keySection = try encoding.hexDecode(
+    "4354454e4644414d0000300000002cced5eb69eafb14550d45bf61dd171d6290cf6a99b42f1c5ade0c0eb31383ea4ca29d5ca412437ebc4c9ba4f47d7a78",
+  )
+  let prefix = keySection.concat(little32(metadata.count())).concat(metadata)
+    .concat(bytes([0, 0, 0, 0, 0])).concat(little32(cover.count() + coverPadding)).concat(little32(cover.count()))
+    .concat(cover).concat("p".repeat(coverPadding).bytes())
+  let source = makeAudioSource(.memory(payload), fileOffset: 0, key: "ISS-5 fixed test key".bytes())
+  return prefix.concat(try source.read(0, length: payload.count()))
+}
+
+fn parseNcmFixture(input: bytes) throws -> NcmAudio = try parseNcm(.memory(input))
+
+fn validationFailure(payload: bytes) throws -> string {
+  let input = try validationNcm(payload)
+  do {
+    let parsed = try parseNcmFixture(input)
+    return "accepted {parsed.format.fileExtension()}"
+  } catch error {
+    return error.message
+  }
+}
+
+test "NCM reports an incomplete section for any truncated container header" (cut: int) {
+  let flac = try encoding.hexDecode(oneFlacFrame)
+  let input = try validationNcm(flac, metadata: bytes([1]), cover: bytes([0xff, 0xd8, 0xff, 0xd9]))
+  let headerLength = input.count() - flac.count()
+  let truncated = input.slice(0, (cut & 0xffff) % headerLength)
+  do {
+    try parseNcmFixture(truncated)
+    expect(false)
+  } catch error {
+    expect(error.message == "文件不完整或数据段长度无效")
+  }
+}
+
+test "NCM rejects FLAC with missing metadata, invalid block sizes or no complete first frame" {
+  let flac = try encoding.hexDecode(oneFlacFrame)
+  let oversized = flac.slice(0, 7).concat(bytes([35])).concat(flac.slice(8, 42))
+  expect(try validationFailure(flac.slice(0, 4)) == "FLAC 元数据块头不完整")
+  expect(try validationFailure(oversized) == "FLAC 的 STREAMINFO 元数据块无效")
+  expect(try validationFailure(flac.slice(0, 41)) == "FLAC 元数据块无效或被截断")
+  expect(try validationFailure(flac.slice(0, 42)) == "FLAC 没有音频帧")
+  expect(try validationFailure(flac.slice(0, 49)) == "FLAC 首帧校验失败或被截断")
+}
+
+test "NCM accepts FLAC with one frame or a short final frame and rejects a missing or truncated final frame" {
+  let single = try encoding.hexDecode(oneFlacFrame)
+  let flac = try encoding.hexDecode(threeFlacFrames)
+  expect(try parseNcmFixture(validationNcm(single)).format.fileExtension() == "flac")
+  expect(try parseNcmFixture(validationNcm(flac)).format.fileExtension() == "flac")
+  expect(try validationFailure(flac.slice(0, 64)) == "FLAC 音频帧与声明的总样本数不符，文件可能被截断")
+  expect(try validationFailure(flac.slice(0, flac.count() - 1)) == "FLAC 末帧校验失败或被截断")
+  let unknownTotal = flac.slice(0, 21).concat(bytes([0xf0, 0, 0, 0, 0])).concat(flac.slice(26, 76))
+  expect(try parseNcmFixture(validationNcm(unknownTotal)).format.fileExtension() == "flac")
+}
+
+fn mpeg25Frame(rateIndex: int) -> bytes {
+  // Mono at 8 kHz, using the first two layer III bitrates (8 and 16 kb/s).
+  var frame = [0xff, 0xe3, (rateIndex << 4) | 8, 0xc0]
+  for _ in 4..<(72 * rateIndex) { frame.push(0) }
+  return bytes(frame)
+}
+
+test "NCM accepts MP3 without ID3, variable bitrate frames, and ID3v2.4 with a footer" {
+  let frame = mpeg25Frame(1)
+  let vbr = frame.concat(mpeg25Frame(2))
+  let tagHeader = bytes([4, 0, 0x10, 0, 0, 0, 12])
+  let body = "TIT2".bytes().concat(bytes([0, 0, 0, 2, 0, 0, 3, 65]))
+  let tag = "ID3".bytes().concat(tagHeader).concat(body).concat("3DI".bytes()).concat(tagHeader)
+  expect(try parseNcmFixture(validationNcm(frame)).format.fileExtension() == "mp3")
+  expect(try parseNcmFixture(validationNcm(vbr)).format.fileExtension() == "mp3")
+  expect(try parseNcmFixture(validationNcm(tag.concat(vbr))).format.fileExtension() == "mp3")
+  expect(try validationFailure(tag) == "MP3 没有音频帧")
+}
+
+test "NCM accepts ID3v1 and APEv2 tails, rejects a truncated MP3 frame or an unknown tail" {
+  let frame = mpeg25Frame(1)
+  let apeFooter = try encoding.hexDecode("4150455441474558d00700002000000000000000000000800000000000000000")
+  let apeHeader = apeFooter.slice(0, 23).concat(bytes([0xa0])).concat(apeFooter.slice(24, 32))
+  var id3v1 = [0x54, 0x41, 0x47]
+  for _ in 3..<128 { id3v1.push(0) }
+  let tails = apeHeader.concat(apeFooter).concat(bytes(id3v1))
+  expect(try parseNcmFixture(validationNcm(frame.concat(tails))).format.fileExtension() == "mp3")
+  expect(try validationFailure(frame.slice(0, 71).concat(tails)) == "MP3 音频帧被截断")
+  expect(try validationFailure(frame.concat(apeFooter)) == "MP3 的 APEv2 尾标签头无效")
+  expect(try validationFailure(frame.concat("junk".bytes())) == "MP3 音频帧头无效或包含未知的尾部数据")
+}
+
+test "NCM distinguishes ADTS AAC and free-format MP3 from supported MPEG Layer III" {
+  let adts = bytes([0xff, 0xf1, 0x50, 0x80, 0x01, 0x1f, 0xfc, 0])
+  let freeFormat = bytes([0xff, 0xfb, 0x00, 0xc0])
+  expect(try validationFailure(adts) == "检测到 ADTS AAC，目前不支持导出此格式")
+  expect(try validationFailure(freeFormat) == "目前不支持自由码率 MP3")
+  expect(try validationFailure("OggS".bytes()) == "无法识别解密后的音频格式，目前支持 FLAC 和 MP3")
+}
+
+async fn exportTestAudio(input: bytes, extension: string) throws -> (bytes, [string]) {
+  let folder = fs.join([fs.tempDir(), "nnam-test-{crypto.uuid()}"])
+  try fs.mkdirAll(folder)
+  defer { try? fs.removeAll(folder) }
+  let source = fs.join([folder, "track.ncm"])
+  let path = fs.join([folder, "track.{extension}"])
+  try fs.write(source, data: input)
+  let converter = NcmConverter()
+  let summary = try await converter.open(source)
+  expect(summary.format == extension)
+  let result = try await converter.exportAudio(path)
+  return (try fs.read(path), result.warnings)
+}
+
+fn testId3Header(version: int, length: int, flags: int = 0) -> bytes {
+  return "ID3".bytes().concat(bytes([version, 0, flags])).concat(synchsafe(length))
+}
+
+test "NCM distinguishes absent metadata from undecodable metadata and still migrates the cover" {
+  let frame = mpeg25Frame(1)
+  let original = try encoding.hexDecode("4944330400000000000c544954320000000200000341").concat(frame)
+  let missing = try validationNcm(original)
+  expect(try parseNcmFixture(missing).metadataIssue?.message() == "源文件未提供歌曲信息")
+  let (untouched, missingWarnings) = try await exportTestAudio(missing, extension: "mp3")
+  expect(untouched == original)
+  expect(missingWarnings.isEmpty())
+
+  let cover = bytes([0xff, 0xd8, 0xff, 0xd9])
+  let corrupt = try validationNcm(original, metadata: bytes([1]), cover: cover)
+  expect(try parseNcmFixture(corrupt).metadataIssue?.message() == "NCM 歌曲信息解码失败")
+  let (exported, warnings) = try await exportTestAudio(corrupt, extension: "mp3")
+  let merged = try encoding.hexDecode(
+    "494433040000000000285449543200000002000003414150494300000012000000696d6167652f6a706567000300ffd8ffd9",
+  )
+  expect(exported == merged.concat(frame))
+  expect(warnings == ["NCM 歌曲信息解码失败"])
+}
+
+test "NCM worker migrates FLAC comments and the front cover while preserving other blocks and frames" {
+  let flac = try encoding.hexDecode(threeFlacFrames)
+  let streamInfo = flac.slice(0, 4).concat(bytes([0])).concat(flac.slice(5, 42))
+  let frames = flac.slice(42, flac.count())
+  let oldComments = try encoding.hexDecode(
+    "040000280600000076656e646f7202000000090000007469746c653d4f6c6409000000444154453d32303234",
+  )
+  let oldFront = try encoding.hexDecode(
+    "06000030000000030000000a696d6167652f6a706567000000000000000000000000000000000000000000000006ffd8ffe0ffd9",
+  )
+  let back = try encoding.hexDecode(
+    "06000030000000040000000a696d6167652f6a706567000000000000000000000000000000000000000000000006ffd8ffe1ffd9",
+  )
+  let lastBlock = bytes([0x86]).concat(back.slice(1, back.count()))
+  let original = streamInfo.concat(oldComments).concat(oldFront).concat(lastBlock).concat(frames)
+
+  let metadata = try encoding.hexDecode(recoveredTitleMetadata)
+  let cover = bytes([0xff, 0xd8, 0xff, 0xd9])
+  let input = try validationNcm(original, metadata: metadata, cover: cover)
+  let (exported, warnings) = try await exportTestAudio(input, extension: "flac")
+
+  let updatedComments = try encoding.hexDecode(
+    "040000350600000076656e646f720200000009000000444154453d32303234160000005449544c453d5265636f766572656420e69bb2e5908d",
+  )
+  let newFront = try encoding.hexDecode(
+    "8600002e000000030000000a696d6167652f6a706567000000000000000000000000000000000000000000000004ffd8ffd9",
+  )
+  expect(exported == streamInfo.concat(updatedComments).concat(back).concat(newFront).concat(frames))
+  expect(warnings.isEmpty())
+}
+
+test "NCM keeps an unwritable ID3 tag verbatim and reports all skipped metadata" {
+  let body = "TT2".bytes().concat(bytes([0, 0, 2, 0, 65]))
+  let original = testId3Header(2, length: body.count()).concat(body).concat(mpeg25Frame(1))
+  let input = try validationNcm(original, metadata: bytes([1]), cover: bytes([0xff, 0xd8, 0xff]))
+  let (exported, warnings) = try await exportTestAudio(input, extension: "mp3")
+  expect(exported == original)
+  expect(warnings == ["NCM 歌曲信息解码失败", "已保留原有 ID3，未迁移 NCM 歌曲信息或封面"])
+
+  let extended = bytes([0, 0, 0, 6, 0, 0, 0, 0, 0, 0])
+    .concat(id3Frame("TIT2", payload: bytes([0, 65]), version: 3))
+  let special = testId3Header(3, length: extended.count(), flags: 0x40).concat(extended).concat(mpeg25Frame(1))
+  let (preserved, taggedWarnings) = try await exportTestAudio(
+    validationNcm(special, cover: bytes([0xff, 0xd8, 0xff])), extension: "mp3",
+  )
+  expect(preserved == special)
+  expect(taggedWarnings == ["已保留原有 ID3，未迁移 NCM 歌曲信息或封面"])
+
+  let (untouched, silentWarnings) = try await exportTestAudio(validationNcm(special), extension: "mp3")
+  expect(untouched == special)
+  expect(silentWarnings.isEmpty())
+}
+
+test "NCM rebuilds an ID3 tag with a broken internal frame length" {
+  let metadata = try encoding.hexDecode(recoveredTitleMetadata)
+  let body = "TIT2".bytes().concat(synchsafe(1000)).concat(bytes([0, 0, 3, 65]))
+  let audio = mpeg25Frame(1).concat(mpeg25Frame(2))
+  let payload = testId3Header(4, length: body.count()).concat(body).concat(audio)
+  let (exported, warnings) = try await exportTestAudio(validationNcm(payload, metadata: metadata), extension: "mp3")
+  let repaired = try encoding.hexDecode("4944330400000000001b54495432000000110000035265636f766572656420e69bb2e5908d")
+  expect(exported == repaired.concat(audio))
+  expect(warnings == ["已移除损坏的 ID3 标签"])
+
+  let (withoutTags, combinedWarnings) = try await exportTestAudio(
+    validationNcm(payload, metadata: bytes([1])), extension: "mp3",
+  )
+  expect(withoutTags == audio)
+  expect(combinedWarnings == ["NCM 歌曲信息解码失败", "已移除损坏的 ID3 标签"])
+}
+
+test "NCM recovers incorrect ID3 total lengths without skipping the first MP3 frame" {
+  let first = mpeg25Frame(1)
+  let audio = first.concat(mpeg25Frame(2)).concat(mpeg25Frame(1))
+  let frame = id3Frame("TIT2", payload: bytes([3, 65]), version: 4)
+  let body = frame.concat(bytes([0, 0, 0, 0]))
+  for size in [frame.count() - 1, body.count() + 1, body.count() + first.count(), 1024] {
+    let payload = testId3Header(4, length: size).concat(body).concat(audio)
+    let (exported, warnings) = try await exportTestAudio(validationNcm(payload), extension: "mp3")
+    expect(exported == audio)
+    expect(warnings == ["已移除损坏的 ID3 标签"])
+  }
+  let invalidSize = bytes([0x80, 0, 0, 0])
+  let payload = testId3Header(4, length: 0).slice(0, 6).concat(invalidSize).concat(body).concat(audio)
+  let (exported, warnings) = try await exportTestAudio(validationNcm(payload), extension: "mp3")
+  expect(exported == audio)
+  expect(warnings == ["已移除损坏的 ID3 标签"])
+}
+
+test "NCM uses a matching ID3 footer to recover the boundary of a tag with a bad header length" {
+  let audio = mpeg25Frame(1).concat(mpeg25Frame(2))
+  let body = id3Frame("TIT2", payload: bytes([3, 65]), version: 4)
+  let footer = "3DI".bytes().concat(testId3Header(4, length: body.count(), flags: 0x10).slice(3, 10))
+  let payload = testId3Header(4, length: 120, flags: 0x10).concat(body).concat(footer).concat(audio)
+  let (exported, warnings) = try await exportTestAudio(validationNcm(payload), extension: "mp3")
+  expect(exported == audio)
+  expect(warnings == ["已移除损坏的 ID3 标签"])
+}
+
+test "NCM rejects an ID3 boundary that only proves a later MP3 frame is valid" {
+  let first = mpeg25Frame(1)
+  let second = mpeg25Frame(2)
+  let invalidBody = "TIT2".bytes().concat(synchsafe(1024)).concat(bytes([0, 0, 3, 65]))
+  let payload = testId3Header(4, length: invalidBody.count() + first.count())
+    .concat(invalidBody).concat(first).concat(second)
+  expect(try validationFailure(payload) == "无法确认 MP3 音频起点，ID3 标签可能覆盖了音频帧")
+  let unknownBoundary = testId3Header(4, length: 1024).concat(invalidBody).concat(first).concat(second)
+  expect(try validationFailure(unknownBoundary) == "无法确认 MP3 音频起点，ID3 标签长度无效")
+}

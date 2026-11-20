@@ -1,0 +1,188 @@
+import platform/accessibility
+import platform/dialog
+import platform/shell
+import std/fs
+import ./converter.{NcmConverter, exportNcmBatch}
+
+let ncmFilters = [dialog.Filter(name: "网易云音乐", extensions: ["ncm"])]
+
+component ConverterScreen {
+  let converter = NcmConverter()
+  state flow = WorkspaceFlow()
+  state incoming: [string] = []
+  state openRequest = 0
+  let busy = flow.isBusy()
+
+  fn announceFeedback(feedback: ExportFeedback) {
+    accessibility.announce(([feedback.message] + feedback.details).joined(separator: "。"))
+  }
+
+  fn reportError(message: string, recovery: string = "") {
+    let feedback = flow.reportError(message, recovery: recovery)
+    announceFeedback(feedback)
+  }
+
+  async fn readInput(path: string) throws {
+    flow.beginReading()
+    let input = try await converter.open(path)
+    flow.finishReading(input)
+    accessibility.announce("已读取 {input.name}，可导出为 {input.format.upper()}")
+  }
+
+  async fn chooseInput() {
+    if flow.isBusy() { return }
+    flow.beginChoosing()
+    defer { flow.endOperation() }
+    do {
+      let paths = try await dialog.open(title: "选择 NCM 文件", filters: ncmFilters)
+      if let path = paths.first() {
+        try await readInput(path)
+      }
+    } catch error {
+      reportError(error.message, recovery: "请选择可读取的 NCM 文件后重试。")
+    }
+  }
+
+  async fn exportFile() {
+    let input = flow.exportableTrack() else { return }
+    flow.beginChoosing()
+    defer { flow.endOperation() }
+    do {
+      let stem = input.name.trimSuffix(fs.ext(input.name))
+      let name = "{stem}.{input.format}"
+      let filters = [dialog.Filter(name: input.format.upper(), extensions: [input.format])]
+      if let path = try await dialog.save(name: name, title: "导出音频", filters: filters) {
+        flow.beginExport()
+        let result = try await converter.exportAudio(path)
+        let feedback = flow.finishExport(result)
+        announceFeedback(feedback)
+      }
+    } catch error {
+      reportError(error.message, recovery: "请检查源文件仍可读取，并选择有写入权限且空间充足的保存位置。")
+    }
+  }
+
+  async fn exportPaths(paths: [string]) throws {
+    let folder = try await dialog.chooseFolder(title: "选择批量导出目录") else { return }
+    flow.beginBatch(total: paths.count())
+    let results = await exportNcmBatch(paths, folder: folder, onProgress: event => { flow.updateBatch(event) })
+    if let summary = flow.finishBatch(results, folder: folder) {
+      announceFeedback(summary)
+    }
+  }
+
+  async fn showDestination() {
+    if flow.isBusy() { return }
+    let destination = flow.destination() else { return }
+    do {
+      match destination {
+        .file(path) => { try await shell.reveal(path) }
+        .folder(path) => { try await shell.open(path) }
+      }
+    } catch error {
+      alert("无法打开导出位置", message: "{error.message}\n请确认导出位置仍然存在。")
+    }
+  }
+
+  async fn chooseBatch() {
+    if flow.isBusy() { return }
+    flow.beginChoosing()
+    defer { flow.endOperation() }
+    do {
+      let paths = try await dialog.open(title: "选择要批量导出的 NCM 文件", filters: ncmFilters, multiple: true)
+      if !paths.isEmpty() {
+        try await exportPaths(paths)
+      }
+    } catch error {
+      reportError(error.message, recovery: "请重新选择要导出的 NCM 文件和导出目录。")
+    }
+  }
+
+  async fn openPaths(paths: [string]) {
+    if flow.isBusy() { return }
+    if paths.isEmpty() || paths.any(path => fs.ext(path).lower() != ".ncm") {
+      reportError("请选择 .ncm 文件")
+      return
+    }
+    flow.beginChoosing()
+    defer { flow.endOperation() }
+    let single = paths.count() == 1
+    do {
+      if single {
+        try await readInput(paths[0])
+      } else {
+        try await exportPaths(paths)
+      }
+    } catch error {
+      let recovery = if single { "请选择可读取的 NCM 文件后重试。" } else { "请重新导入 NCM 文件并选择导出目录。" }
+      reportError(error.message, recovery: recovery)
+    }
+  }
+
+  onOpenFiles(paths => {
+    if !flow.isBusy() {
+      incoming = paths
+      openRequest += 1
+    }
+  })
+
+  task(openRequest) {
+    if openRequest > 0 {
+      await openPaths(incoming)
+    }
+  }
+
+  if @platform == .macOS {
+    MenuBar {
+      Menu("File") {
+        MenuItem("选择 NCM 文件…") {
+          shortcut: Shortcut(key: "o", primary: true)
+          disabled: busy
+          on press { await chooseInput() }
+        }
+        MenuItem("批量导出…") {
+          shortcut: Shortcut(key: "b", primary: true)
+          disabled: busy
+          on press { await chooseBatch() }
+        }
+        MenuSeparator()
+        MenuItem("导出音频…") {
+          shortcut: Shortcut(key: "s", primary: true)
+          disabled: flow.exportableTrack() == none
+          on press { await exportFile() }
+        }
+      }
+    }
+  }
+
+  SafeArea {
+    grow: 1
+    Column as workspace {
+      grow: 1
+      WorkspaceContent(flow, workspace.dragOver)
+      WorkspaceActions(flow) {
+        on choose { await chooseInput() }
+        on batch { await chooseBatch() }
+        on save { await exportFile() }
+        on reveal { await showDestination() }
+        on back { flow.leaveBatchResults() }
+      }
+      dropTypes: if busy { [] } else { ["*/*"] }
+      on drop(drop) {
+        let paths = drop.items.map(item => item.path)
+        await openPaths(paths)
+      }
+    }
+  }
+}
+
+app {
+  Window {
+    title: "nnam"
+    width: 600
+    height: 360
+    minWidth: 320
+    minHeight: 280
+    ConverterScreen()
+  }
+}

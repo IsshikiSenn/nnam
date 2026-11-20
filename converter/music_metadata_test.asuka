@@ -1,0 +1,31 @@
+import std/encoding
+
+test "NCM artists come from the root and support mixed ID types and escaped names" {
+  let source = r#"{"extra":{"artist":[["nested",0]]},"musicName":"曲名","artist":[["水星",42],["A \"B\"","other"],[null,0],["",1]],"album":"专辑"}"#
+  let metadata = try parseMusicMetadata(source)
+  expect(metadata.musicName == "曲名")
+  expect(metadata.album == "专辑")
+  expect(metadata.artists == ["水星", "A \"B\""])
+  expect(metadata.tags()["ARTIST"] == "水星 / A \"B\"")
+}
+
+test "NCM ignores malformed artist entries and keeps valid names in order" {
+  let metadata = try parseMusicMetadata(r#"{"artist":[["水星",1],[],[""],[42,0],{"name":"ignored"},["🎧","id"],["水星",null]]}"#)
+  expect(metadata.artists == ["水星", "🎧", "水星"])
+  expect((try parseMusicMetadata(r#"{"extra":{"artist":[["nested",0]]}}"#)).artists.isEmpty())
+  expect((try parseMusicMetadata(r#"{"artist":null}"#)).artists.isEmpty())
+  expect((try parseMusicMetadata(r#"{"artist":{}}"#)).artists.isEmpty())
+}
+
+test "NCM uses the last artist field and still requires text for song and album names" {
+  let metadata = try parseMusicMetadata(r#"{"artist":[["old",1]],"artist":[["new",2]]}"#)
+  expect(metadata.artists == ["new"])
+  expect((try parseMusicMetadata(r#"{"artist":[["old",1]],"artist":null}"#)).artists.isEmpty())
+  expect((try? parseMusicMetadata(r#"{"musicName":42}"#)) == none)
+  expect((try? parseMusicMetadata(r#"{"album":[]}"#)) == none)
+}
+
+test "ID3v2.3 encodes supplementary Unicode characters and a byte-order mark" {
+  let expected = try encoding.hexDecode("01fffe376834d81edd")
+  expect(id3Utf16("样𝄞") == expected)
+}
